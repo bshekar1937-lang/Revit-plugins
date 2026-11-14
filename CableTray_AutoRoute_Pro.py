@@ -7,7 +7,9 @@ __doc__ = (
     "dialog. Unworkable dimensions are detected and workable values are "
     "suggested for confirmation before anything is created. An optional "
     "Comments text - with tokens such as {size}, {tier} and {level} - is "
-    "written on every tray and fitting the tool creates."
+    "written on every tray and fitting the tool creates. A tabbed preview "
+    "lists every clash with existing services - linked models included - "
+    "before anything is placed."
 )
 
 # =============================================================================
@@ -38,7 +40,16 @@ __doc__ = (
 #      pass, and each tee stays level.
 #   5. Tees are inserted with Revit's NewTeeFitting, so Revit picks the tray
 #      type's Tee family and SIZES IT to the trays automatically.
-#   6. A clash preview is shown BEFORE anything is created.
+#   6. A tabbed clash PREVIEW is shown BEFORE anything is created:
+#        - Overview        : what will be created, tee by tee
+#        - Existing services: every bounding-box overlap with ducts,
+#          pipes, conduit and other cable trays - in this model and, if
+#          asked, in the linked models. Each row can be selected or
+#          zoomed to in Revit, and the check can be re-run with a
+#          different clearance without leaving the window.
+#        - Tray crossings  : planned trays that cross each other
+#          without enough vertical separation.
+#      From there you can create, go back to the settings, or cancel.
 #   7. COMMENTS: one text - with tokens such as {part}, {size}, {tier},
 #      {line} and {level} - is written into the built-in Comments
 #      parameter of every tray, and of the fittings too if asked, so the
@@ -72,9 +83,13 @@ import clr
 clr.AddReference("PresentationFramework")
 clr.AddReference("PresentationCore")
 clr.AddReference("WindowsBase")
-from System.Windows import GridLength, GridUnitType, SystemParameters, Thickness
+from System.Collections.Generic import List
+from System.Windows import (
+    Clipboard, GridLength, GridUnitType, SystemParameters, Thickness
+)
 from System.Windows.Controls import (
-    Border, Button, ColumnDefinition, Grid, TextBlock, TextBox
+    Border, Button, ColumnDefinition, Grid, RowDefinition, StackPanel,
+    TextBlock, TextBox
 )
 
 
@@ -427,63 +442,215 @@ def tee_junctions(line_segments):
 # =============================================================================
 # Clash checks (read-only)
 # =============================================================================
-def service_clashes(proposed_trays):
-    """Bounding-box preview of planned tray segments vs existing services."""
-    categories = (
-        DB.BuiltInCategory.OST_CableTray,
-        DB.BuiltInCategory.OST_CableTrayFitting,
-        DB.BuiltInCategory.OST_Conduit,
-        DB.BuiltInCategory.OST_ConduitFitting,
-        DB.BuiltInCategory.OST_DuctCurves,
-        DB.BuiltInCategory.OST_DuctFitting,
-        DB.BuiltInCategory.OST_FlexDuctCurves,
-        DB.BuiltInCategory.OST_PipeCurves,
-        DB.BuiltInCategory.OST_PipeFitting,
-        DB.BuiltInCategory.OST_FlexPipeCurves,
+# Existing services the planned trays are checked against.
+SERVICE_CATEGORIES = (
+    DB.BuiltInCategory.OST_CableTray,
+    DB.BuiltInCategory.OST_CableTrayFitting,
+    DB.BuiltInCategory.OST_Conduit,
+    DB.BuiltInCategory.OST_ConduitFitting,
+    DB.BuiltInCategory.OST_DuctCurves,
+    DB.BuiltInCategory.OST_DuctFitting,
+    DB.BuiltInCategory.OST_FlexDuctCurves,
+    DB.BuiltInCategory.OST_PipeCurves,
+    DB.BuiltInCategory.OST_PipeFitting,
+    DB.BuiltInCategory.OST_FlexPipeCurves,
+)
+
+DEFAULT_SERVICE_CLEARANCE_MM = 1.0   # the preview starts hard up against
+
+
+def element_type_name(element):
+    """Family / type name of an existing element, for the clash list."""
+    for getter in ("Name",):
+        try:
+            name = getattr(element, getter)
+            if name:
+                return name
+        except Exception:
+            pass
+    try:
+        symbol = doc.GetElement(element.GetTypeId())
+        if symbol is not None:
+            return fitting_type_name(symbol)
+    except Exception:
+        pass
+    return "(unnamed)"
+
+
+def element_category_name(element):
+    try:
+        return element.Category.Name if element.Category else "Service"
+    except Exception:
+        return "Service"
+
+
+def transformed_bounds(transform, minimum, maximum):
+    """Axis-aligned bounds of a linked box brought into host coordinates."""
+    corners = [
+        transform.OfPoint(DB.XYZ(x, y, z))
+        for x in (minimum.X, maximum.X)
+        for y in (minimum.Y, maximum.Y)
+        for z in (minimum.Z, maximum.Z)
+    ]
+    return (
+        DB.XYZ(min(point.X for point in corners),
+               min(point.Y for point in corners),
+               min(point.Z for point in corners)),
+        DB.XYZ(max(point.X for point in corners),
+               max(point.Y for point in corners),
+               max(point.Z for point in corners)),
     )
-    existing = []
+
+
+def collect_service_boxes(source_doc, link_name=None, transform=None):
+    """Bounding boxes of the services in one document, host coordinates."""
+    boxes = []
     seen_ids = set()
-    for category in categories:
-        for element in (
-            DB.FilteredElementCollector(doc)
-            .OfCategory(category)
-            .WhereElementIsNotElementType()
-            .ToElements()
-        ):
+    for category in SERVICE_CATEGORIES:
+        try:
+            elements = (
+                DB.FilteredElementCollector(source_doc)
+                .OfCategory(category)
+                .WhereElementIsNotElementType()
+                .ToElements()
+            )
+        except Exception:
+            continue        # category not present in that document
+        for element in elements:
             element_id = element_id_value(element.Id)
             if element_id in seen_ids:
                 continue
             seen_ids.add(element_id)
-            box = element.get_BoundingBox(None)
+            try:
+                box = element.get_BoundingBox(None)
+            except Exception:
+                box = None
             if box is None:
                 continue
-            existing.append((element, box.Min, box.Max))
+            minimum, maximum = box.Min, box.Max
+            if transform is not None and not transform.IsIdentity:
+                minimum, maximum = transformed_bounds(
+                    transform, minimum, maximum
+                )
+            boxes.append({
+                "element": element,
+                "id": element_id,
+                "min": minimum,
+                "max": maximum,
+                "link": link_name,
+                "category": element_category_name(element),
+                "name": element_type_name(element),
+            })
+    return boxes
 
-    clashes = []
-    clearance = mm_to_internal(1)
+
+def service_boxes(include_links=False):
+    """Every existing service to check against, in host coordinates.
+
+    Linked models hold most other disciplines, so they can be included -
+    their boxes are transformed by the link's own position."""
+    boxes = collect_service_boxes(doc)
+    if not include_links:
+        return boxes
+    try:
+        link_instances = (
+            DB.FilteredElementCollector(doc)
+            .OfClass(DB.RevitLinkInstance)
+            .ToElements()
+        )
+    except Exception:
+        return boxes
+    for link_instance in link_instances:
+        try:
+            link_doc = link_instance.GetLinkDocument()
+        except Exception:
+            link_doc = None
+        if link_doc is None:
+            continue        # not loaded
+        try:
+            transform = link_instance.GetTotalTransform()
+        except Exception:
+            transform = None
+        try:
+            link_name = link_instance.Name
+        except Exception:
+            link_name = "linked model"
+        boxes.extend(
+            collect_service_boxes(link_doc, link_name, transform)
+        )
+    return boxes
+
+
+def tray_bounds(proposed, clearance):
+    """Box of a planned tray piece, grown by its size and the clearance."""
+    start = proposed["start"]
+    end = proposed["end"]
+    half_width = mm_to_internal(proposed["width"]) / 2.0
+    half_height = mm_to_internal(proposed["height"]) / 2.0
+    return (
+        DB.XYZ(min(start.X, end.X) - half_width - clearance,
+               min(start.Y, end.Y) - half_width - clearance,
+               min(start.Z, end.Z) - half_height - clearance),
+        DB.XYZ(max(start.X, end.X) + half_width + clearance,
+               max(start.Y, end.Y) + half_width + clearance,
+               max(start.Z, end.Z) + half_height + clearance),
+    )
+
+
+def box_overlap_mm(first_min, first_max, second_min, second_max):
+    """Overlap of two boxes per axis in mm, or None when they are clear."""
+    overlap = []
+    for low, high, other_low, other_high in (
+            (first_min.X, first_max.X, second_min.X, second_max.X),
+            (first_min.Y, first_max.Y, second_min.Y, second_max.Y),
+            (first_min.Z, first_max.Z, second_min.Z, second_max.Z)):
+        depth = min(high, other_high) - max(low, other_low)
+        if depth < 0.0:
+            return None
+        overlap.append(internal_to_mm(depth))
+    return tuple(overlap)
+
+
+def service_clashes(proposed_trays,
+                    clearance_mm=DEFAULT_SERVICE_CLEARANCE_MM,
+                    include_links=False, boxes=None):
+    """Bounding-box clashes of the planned trays with existing services.
+
+    One record per existing element, with every tray piece that hits it and
+    the deepest overlap, so the preview lists services rather than pairs."""
+    if boxes is None:
+        boxes = service_boxes(include_links)
+    clearance = mm_to_internal(clearance_mm)
+    found = {}
+    order = []
     for proposed in proposed_trays:
-        start = proposed["start"]
-        end = proposed["end"]
-        half_width = mm_to_internal(proposed["width"]) / 2.0
-        half_height = mm_to_internal(proposed["height"]) / 2.0
-        minimum = DB.XYZ(
-            min(start.X, end.X) - half_width - clearance,
-            min(start.Y, end.Y) - half_width - clearance,
-            min(start.Z, end.Z) - half_height - clearance
-        )
-        maximum = DB.XYZ(
-            max(start.X, end.X) + half_width + clearance,
-            max(start.Y, end.Y) + half_width + clearance,
-            max(start.Z, end.Z) + half_height + clearance
-        )
-        for element, other_min, other_max in existing:
-            if (
-                minimum.X <= other_max.X and maximum.X >= other_min.X
-                and minimum.Y <= other_max.Y and maximum.Y >= other_min.Y
-                and minimum.Z <= other_max.Z and maximum.Z >= other_min.Z
-            ):
-                clashes.append((proposed, element))
+        tray_min, tray_max = tray_bounds(proposed, clearance)
+        for service in boxes:
+            overlap = box_overlap_mm(
+                tray_min, tray_max, service["min"], service["max"]
+            )
+            if overlap is None:
+                continue
+            key = (service["link"], service["id"])
+            record = found.get(key)
+            if record is None:
+                record = dict(service)
+                record["pieces"] = []
+                record["overlap"] = overlap
+                found[key] = record
+                order.append(key)
+            record["pieces"].append(proposed)
+            if min(overlap) > min(record["overlap"]):
+                record["overlap"] = overlap
+    clashes = [found[key] for key in order]
+    # Worst first: the deepest overlap is the one worth looking at.
+    clashes.sort(key=lambda item: min(item["overlap"]), reverse=True)
     return clashes
+
+
+def describe_overlap(overlap):
+    """'120 x 45 x 80 mm' for a clash record's overlap."""
+    return "{:.0f} x {:.0f} x {:.0f} mm".format(*overlap)
 
 
 def internal_crossings(segments):
@@ -3580,6 +3747,784 @@ def run_form(settings, button_text, previous=None):
 
 
 # =============================================================================
+# CLASH PREVIEW (tabbed, read-only - shown before anything is created)
+# =============================================================================
+# Three tabs: what will be created, every clash with the services already in
+# the model (linked models included on request) and the planned trays that
+# cross each other. Each service row can be selected or zoomed to in Revit,
+# and the check can be re-run with a different clearance without leaving the
+# window. The clearance / linked-model choice is kept for the rest of the
+# session, so going back to the settings and returning does not reset it.
+PREVIEW_STATE = {
+    "clearance": DEFAULT_SERVICE_CLEARANCE_MM,
+    "links": False,
+}
+
+MAX_PREVIEW_ROWS = 200      # keeps the window responsive on busy models
+
+CLASH_XAML = """
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Cable Tray Clash Preview" Width="960" SizeToContent="Height"
+        ResizeMode="NoResize" WindowStartupLocation="CenterScreen"
+        ShowInTaskbar="False" Background="#F1F4F9"
+        FontFamily="Segoe UI" FontSize="12" Foreground="#1E293B"
+        UseLayoutRounding="True">
+  <Window.Resources>
+    <Style x:Key="Card" TargetType="Border">
+      <Setter Property="Background" Value="White"/>
+      <Setter Property="BorderBrush" Value="#E2E8F0"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="10"/>
+      <Setter Property="Padding" Value="14,12"/>
+    </Style>
+    <Style x:Key="Label" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="#334155"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Margin" Value="0,0,0,5"/>
+    </Style>
+    <Style x:Key="Hint" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="#64748B"/>
+      <Setter Property="FontSize" Value="11"/>
+      <Setter Property="TextWrapping" Value="Wrap"/>
+    </Style>
+    <Style TargetType="TextBox">
+      <Setter Property="Height" Value="30"/>
+      <Setter Property="Padding" Value="8,0"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+      <Setter Property="BorderBrush" Value="#CBD5E1"/>
+    </Style>
+    <Style TargetType="TabControl">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Padding" Value="0,10,0,0"/>
+    </Style>
+    <Style TargetType="TabItem">
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Foreground" Value="#475569"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TabItem">
+            <Border x:Name="bd" Background="Transparent" CornerRadius="8"
+                    Padding="14,8" Margin="0,0,6,0">
+              <ContentPresenter ContentSource="Header"
+                                VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bd" Property="Background" Value="#E2E8F0"/>
+              </Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="bd" Property="Background" Value="White"/>
+                <Setter Property="Foreground" Value="#1D4ED8"/>
+                <Setter Property="FontWeight" Value="SemiBold"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="PrimaryButton" TargetType="Button">
+      <Setter Property="Foreground" Value="White"/>
+      <Setter Property="Background" Value="#2563EB"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Height" Value="36"/>
+      <Setter Property="Padding" Value="20,0"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bd" Background="{TemplateBinding Background}"
+                    CornerRadius="8" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center"
+                                VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bd" Property="Background" Value="#1D4ED8"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="SecondaryButton" TargetType="Button">
+      <Setter Property="Foreground" Value="#334155"/>
+      <Setter Property="Background" Value="White"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Height" Value="36"/>
+      <Setter Property="Padding" Value="16,0"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bd" Background="{TemplateBinding Background}"
+                    BorderBrush="#CBD5E1" BorderThickness="1"
+                    CornerRadius="8" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center"
+                                VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bd" Property="Background" Value="#F1F5F9"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="SmallButton" TargetType="Button"
+           BasedOn="{StaticResource SecondaryButton}">
+      <Setter Property="Height" Value="26"/>
+      <Setter Property="Padding" Value="10,0"/>
+      <Setter Property="FontSize" Value="11"/>
+      <Setter Property="FontWeight" Value="Normal"/>
+      <Setter Property="Margin" Value="4,0,0,0"/>
+    </Style>
+    <Style x:Key="RowCardBad" TargetType="Border">
+      <Setter Property="Background" Value="#FEF2F2"/>
+      <Setter Property="BorderBrush" Value="#FCA5A5"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="8"/>
+      <Setter Property="Padding" Value="10,8"/>
+      <Setter Property="Margin" Value="0,0,0,6"/>
+    </Style>
+    <Style x:Key="RowCardGood" TargetType="Border">
+      <Setter Property="Background" Value="#F0FDF4"/>
+      <Setter Property="BorderBrush" Value="#BBF7D0"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="8"/>
+      <Setter Property="Padding" Value="10,8"/>
+      <Setter Property="Margin" Value="0,0,0,6"/>
+    </Style>
+    <Style x:Key="RowTitle" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="#0F172A"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+    </Style>
+    <Style x:Key="RowMeta" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="#64748B"/>
+      <Setter Property="FontSize" Value="11"/>
+      <Setter Property="TextWrapping" Value="Wrap"/>
+      <Setter Property="Margin" Value="0,2,0,0"/>
+    </Style>
+    <Style x:Key="RowBad" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="#B91C1C"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="FontSize" Value="11.5"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+      <Setter Property="TextWrapping" Value="Wrap"/>
+    </Style>
+    <Style x:Key="RowGood" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="#166534"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+      <Setter Property="TextWrapping" Value="Wrap"/>
+    </Style>
+    <Style x:Key="StatusGood" TargetType="Border">
+      <Setter Property="Background" Value="#F0FDF4"/>
+      <Setter Property="BorderBrush" Value="#BBF7D0"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="6"/>
+      <Setter Property="Padding" Value="10,7"/>
+    </Style>
+    <Style x:Key="StatusBad" TargetType="Border">
+      <Setter Property="Background" Value="#FEF2F2"/>
+      <Setter Property="BorderBrush" Value="#FCA5A5"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="6"/>
+      <Setter Property="Padding" Value="10,7"/>
+    </Style>
+  </Window.Resources>
+
+  <Grid>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <!-- ===== Header ===== -->
+    <Border Grid.Row="0" Padding="24,16">
+      <Border.Background>
+        <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+          <GradientStop Color="#1E3A8A" Offset="0"/>
+          <GradientStop Color="#2563EB" Offset="1"/>
+        </LinearGradientBrush>
+      </Border.Background>
+      <DockPanel>
+        <Border DockPanel.Dock="Left" Width="44" Height="44" CornerRadius="10"
+                Background="#33FFFFFF" Margin="0,0,14,0">
+          <Path Stroke="White" StrokeThickness="2.4" StrokeLineJoin="Round"
+                StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                HorizontalAlignment="Center" VerticalAlignment="Center"
+                Data="M 2,14 L 24,14 M 13,3 L 13,25 M 7,8 L 19,20 M 19,8 L 7,20"/>
+        </Border>
+        <StackPanel VerticalAlignment="Center">
+          <TextBlock Text="Clash preview" FontSize="19" FontWeight="SemiBold"
+                     Foreground="White"/>
+          <TextBlock x:Name="tbHeadline" FontSize="12" Foreground="#DBEAFE"
+                     Margin="0,2,0,0"/>
+        </StackPanel>
+      </DockPanel>
+    </Border>
+
+    <!-- ===== Tabs ===== -->
+    <TabControl Grid.Row="1" Margin="20,14,20,0" BorderThickness="0">
+
+      <!-- Overview -->
+      <TabItem x:Name="tabOverview">
+        <Border Style="{StaticResource Card}">
+          <ScrollViewer MaxHeight="430" VerticalScrollBarVisibility="Auto">
+            <TextBlock x:Name="tbOverview" TextWrapping="Wrap"
+                       FontFamily="Consolas" FontSize="11.5"
+                       Foreground="#1E293B"/>
+          </ScrollViewer>
+        </Border>
+      </TabItem>
+
+      <!-- Existing services -->
+      <TabItem x:Name="tabServices">
+        <Border Style="{StaticResource Card}">
+          <Grid>
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <Grid Grid.Row="0" Margin="0,0,0,10">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <TextBlock x:Name="tbServiceStatus" Grid.Column="0"
+                         Style="{StaticResource Hint}"
+                         VerticalAlignment="Center" Margin="0,0,14,0"/>
+              <StackPanel Grid.Column="1" Orientation="Horizontal"
+                          VerticalAlignment="Center" Margin="0,0,12,0">
+                <TextBlock Text="Clearance (mm)" VerticalAlignment="Center"
+                           Foreground="#334155" FontWeight="SemiBold"
+                           Margin="0,0,8,0"/>
+                <TextBox x:Name="tbServiceClearance" Width="64"
+                         ToolTip="The planned trays are grown by this much before the check, so a near miss shows up as a clash. 0 reports only real overlaps."/>
+              </StackPanel>
+              <CheckBox x:Name="cbIncludeLinks" Grid.Column="2"
+                        VerticalAlignment="Center" Margin="0,0,12,0"
+                        VerticalContentAlignment="Center"
+                        ToolTip="Also check the services in loaded linked models (other disciplines usually live there). Their elements cannot be selected from this model.">
+                <TextBlock Text="Linked models" Foreground="#334155"
+                           FontWeight="SemiBold"/>
+              </CheckBox>
+              <Button x:Name="btnRecheck" Grid.Column="3" Content="Re-check"
+                      Style="{StaticResource SecondaryButton}" Height="30"/>
+            </Grid>
+            <ScrollViewer Grid.Row="1" MaxHeight="370"
+                          VerticalScrollBarVisibility="Auto">
+              <StackPanel x:Name="spServices"/>
+            </ScrollViewer>
+          </Grid>
+        </Border>
+      </TabItem>
+
+      <!-- Tray-to-tray -->
+      <TabItem x:Name="tabInternal">
+        <Border Style="{StaticResource Card}">
+          <StackPanel>
+            <TextBlock Style="{StaticResource Hint}" Margin="0,0,0,10"
+                       Text="Planned trays whose centrelines cross in plan without enough vertical separation. Raise the offset step, or switch the crossing direction to Alternate, to clear them."/>
+            <ScrollViewer MaxHeight="390" VerticalScrollBarVisibility="Auto">
+              <StackPanel x:Name="spInternal"/>
+            </ScrollViewer>
+          </StackPanel>
+        </Border>
+      </TabItem>
+    </TabControl>
+
+    <!-- ===== Footer ===== -->
+    <Border Grid.Row="2" Background="White" BorderBrush="#E2E8F0"
+            BorderThickness="0,1,0,0" Padding="20,14" Margin="0,14,0,0">
+      <DockPanel>
+        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal"
+                    VerticalAlignment="Center">
+          <Button x:Name="btnCopy" Content="Copy report"
+                  Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"/>
+          <Button x:Name="btnEdit" Content="Back to settings"
+                  Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"/>
+          <Button x:Name="btnCancel" Content="Cancel"
+                  Style="{StaticResource SecondaryButton}" Margin="0,0,10,0"
+                  IsCancel="True"/>
+          <Button x:Name="btnCreate" Content="Create the cable trays"
+                  Style="{StaticResource PrimaryButton}" IsDefault="True"/>
+        </StackPanel>
+        <Border x:Name="brdStatus" Style="{StaticResource StatusGood}"
+                VerticalAlignment="Center" Margin="0,0,16,0">
+          <TextBlock x:Name="tbStatus" TextWrapping="Wrap" FontSize="11.5"/>
+        </Border>
+      </DockPanel>
+    </Border>
+  </Grid>
+</Window>
+"""
+
+
+def preview_lines(plan, values, internal, clashes, clearance_mm,
+                  include_links):
+    """The Overview tab - what will be created, and the headline checks."""
+    sizes = values["sizes"]
+    segments = plan["segments"]
+    tee_plans = plan["tee_plans"]
+    crossing = plan["crossing"]
+    tray_type = tray_types[values["type_index"]]
+    tee_symbol = None
+    if tee_nodes and 0 <= values["tee_index"] < len(tee_options):
+        tee_symbol = tee_options[values["tee_index"]]
+    reference_level = project_levels[values["level_index"]]
+    offset_tees = [item for item in tee_plans if abs(item["lift"]) > EPSILON]
+    lines = [
+        "Planned: {} tray piece(s) on {} detail line(s), {} size(s) x {} "
+        "tier(s).".format(len(segments), len(references), len(sizes),
+                          values["tiers"]),
+        "1st tier: {} at {} FFL {:+g} mm (tier gap {:g} mm).".format(
+            REFERENCE_NAMES[values["reference"]], reference_level.Name,
+            values["ffl_offset"], values["tier_spacing"]
+        ),
+        "Lane spacing: {:g} mm, tray type '{}'.".format(
+            values["run_spacing"], tray_type_name(tray_type)
+        ),
+    ]
+    if corner_count:
+        corner_leg = max(plan["corner_legs"] or [0.0])
+        lines.append(
+            "Corners: {} - a horizontal bend per lane and tier{}.".format(
+                corner_count,
+                " (bend leg {:.0f} mm)".format(internal_to_mm(corner_leg))
+                if corner_leg > EPSILON else ""
+            )
+        )
+    if tee_nodes:
+        lines.append("")
+        lines.append("Tee fitting: {}".format(fitting_type_name(tee_symbol)))
+        for index, size in enumerate(sizes):
+            fit = plan["fits"][index]
+            line = (
+                "  {:g}x{:g}: tee reach {:.0f} mm (main) / {:.0f} mm "
+                "(branch)".format(
+                    size[0], size[1], internal_to_mm(fit["main_arm"]),
+                    internal_to_mm(fit["branch_arm"])
+                )
+            )
+            if fit["bend_leg"] > EPSILON:
+                line += ", vertical bend {:.0f} mm".format(
+                    internal_to_mm(fit["bend_leg"])
+                )
+            lines.append(line)
+        if crossing["enabled"]:
+            lines.append(
+                "Tee junctions: {} - {} lane tee(s) offset {} by {:g} mm per "
+                "level ({:g} deg bends, {:g} mm clearance).".format(
+                    len(tee_nodes), len(offset_tees),
+                    DIRECTION_NAMES[crossing["mode"]], values["step"],
+                    values["angle"], values["clearance"]
+                )
+            )
+        else:
+            lines.append(
+                "Tee junctions: {} - crossing offsets are OFF.".format(
+                    len(tee_nodes)
+                )
+            )
+    lines.append("")
+    if values.get("comments_on"):
+        comment_base = base_comment_tokens(
+            values, tray_type, reference_level, tee_symbol
+        )
+        lines.append(
+            u'Comments on {}: "{}" (first tray; tokens change per element, '
+            u'existing text {}).'.format(
+                COMMENT_TARGET_NAMES[values["comments_target"]],
+                format_comment(values["comments_text"], comment_base),
+                COMMENT_MODE_NAMES[values["comments_mode"]]
+            )
+        )
+    else:
+        lines.append("Comments: not written.")
+    lines.append("")
+    lines.append("Checks")
+    lines.append(
+        "  Existing services: {} - bounding boxes, {:g} mm clearance, "
+        "linked models {}.".format(
+            len(clashes) or "none", clearance_mm,
+            "included" if include_links else "not checked"
+        )
+    )
+    lines.append("  Tray to tray    : {}.".format(len(internal) or "none"))
+    return lines
+
+
+class ClashPreviewWindow(forms.WPFWindow):
+    """Tabbed preview of the planned trays and everything they clash with."""
+
+    def __init__(self, plan, values, internal, clashes, clearance_mm,
+                 include_links):
+        forms.WPFWindow.__init__(self, CLASH_XAML, literal_string=True)
+        self.plan = plan
+        self.values = values
+        self.segments = plan["segments"]
+        self.internal = internal
+        self.clashes = clashes
+        self.clearance_mm = clearance_mm
+        self.include_links = include_links
+        self.choice = "cancel"
+        try:
+            self.MaxHeight = SystemParameters.WorkArea.Height - 20
+        except Exception:
+            pass
+        self.tbServiceClearance.Text = "{:g}".format(clearance_mm)
+        self.cbIncludeLinks.IsChecked = include_links
+        self.btnRecheck.Click += self.on_recheck
+        self.btnCopy.Click += self.on_copy
+        self.btnCreate.Click += self.on_create
+        self.btnEdit.Click += self.on_edit
+        self.btnCancel.Click += self.on_cancel
+        self.refresh()
+
+    # ----- filling the tabs --------------------------------------------------
+    def refresh(self):
+        """Re-draw the headers, both lists and the overall verdict."""
+        self.tbOverview.Text = "\n".join(preview_lines(
+            self.plan, self.values, self.internal, self.clashes,
+            self.clearance_mm, self.include_links
+        ))
+        self.tabOverview.Header = "Overview"
+        self.tabServices.Header = "Existing services ({})".format(
+            len(self.clashes)
+        )
+        self.tabInternal.Header = "Tray crossings ({})".format(
+            len(self.internal)
+        )
+        self.tbHeadline.Text = (
+            "{} tray piece(s) planned - nothing is created until you say so."
+            .format(len(self.segments))
+        )
+        self.show_services()
+        self.show_internal()
+        self.show_verdict()
+
+    def show_verdict(self):
+        clear = not self.clashes and not self.internal
+        self.brdStatus.Style = self.FindResource(
+            "StatusGood" if clear else "StatusBad"
+        )
+        self.tbStatus.Style = self.FindResource("RowGood" if clear
+                                                else "RowBad")
+        if clear:
+            self.tbStatus.Text = (
+                "No clashes found: clear of the existing services and of the "
+                "other planned trays."
+            )
+            return
+        parts = []
+        if self.clashes:
+            parts.append("{} existing service(s)".format(len(self.clashes)))
+        if self.internal:
+            parts.append("{} tray crossing(s)".format(len(self.internal)))
+        self.tbStatus.Text = (
+            "Clashes with {} - check the tabs before creating.".format(
+                " and ".join(parts)
+            )
+        )
+
+    def show_services(self):
+        self.spServices.Children.Clear()
+        self.tbServiceStatus.Text = (
+            "{} existing service(s) overlap the planned trays "
+            "({:g} mm clearance, linked models {}).".format(
+                len(self.clashes), self.clearance_mm,
+                "included" if self.include_links else "not checked"
+            )
+        )
+        if not self.clashes:
+            self.spServices.Children.Add(self.make_message_row(
+                "No bounding-box overlap with the existing services.",
+                "RowCardGood", "RowGood"
+            ))
+            return
+        for record in self.clashes[:MAX_PREVIEW_ROWS]:
+            self.spServices.Children.Add(self.make_service_row(record))
+        if len(self.clashes) > MAX_PREVIEW_ROWS:
+            self.spServices.Children.Add(self.make_message_row(
+                "... and {} more - use Copy report for the full list.".format(
+                    len(self.clashes) - MAX_PREVIEW_ROWS
+                ),
+                "RowCardBad", "RowBad"
+            ))
+
+    def show_internal(self):
+        self.spInternal.Children.Clear()
+        if not self.internal:
+            self.spInternal.Children.Add(self.make_message_row(
+                "Every planned crossing has enough vertical clearance.",
+                "RowCardGood", "RowGood"
+            ))
+            return
+        for item in self.internal[:MAX_PREVIEW_ROWS]:
+            self.spInternal.Children.Add(self.make_internal_row(item))
+        if len(self.internal) > MAX_PREVIEW_ROWS:
+            self.spInternal.Children.Add(self.make_message_row(
+                "... and {} more.".format(
+                    len(self.internal) - MAX_PREVIEW_ROWS
+                ),
+                "RowCardBad", "RowBad"
+            ))
+
+    # ----- rows ---------------------------------------------------------------
+    def make_message_row(self, message, card_style, text_style):
+        card = Border()
+        card.Style = self.FindResource(card_style)
+        label = TextBlock()
+        label.Style = self.FindResource(text_style)
+        label.Text = message
+        card.Child = label
+        return card
+
+    def make_service_row(self, record):
+        """One existing service: what it is, how deep, and where to look."""
+        card = Border()
+        card.Style = self.FindResource("RowCardBad")
+        grid = Grid()
+        for spec in (GridLength(1, GridUnitType.Star), GridLength(150),
+                     GridLength(66), GridLength(62)):
+            column = ColumnDefinition()
+            column.Width = spec
+            grid.ColumnDefinitions.Add(column)
+
+        details = StackPanel()
+        title = TextBlock()
+        title.Style = self.FindResource("RowTitle")
+        title.Text = u"{} - {}".format(record["category"], record["name"])
+        meta = TextBlock()
+        meta.Style = self.FindResource("RowMeta")
+        meta.Text = u"ID {} ({})  |  {} tray piece(s): {}".format(
+            record["id"],
+            u"in {}".format(record["link"]) if record["link"]
+            else "this model",
+            len(record["pieces"]), self.piece_labels(record["pieces"])
+        )
+        details.Children.Add(title)
+        details.Children.Add(meta)
+
+        overlap = TextBlock()
+        overlap.Style = self.FindResource("RowBad")
+        overlap.Text = u"overlap\n{}".format(
+            describe_overlap(record["overlap"])
+        )
+
+        select_button = Button()
+        select_button.Content = "Select"
+        select_button.Style = self.FindResource("SmallButton")
+        zoom_button = Button()
+        zoom_button.Content = "Zoom to"
+        zoom_button.Style = self.FindResource("SmallButton")
+        if record["link"]:
+            # Linked elements belong to the link document: this model cannot
+            # select them, so say where they live instead.
+            for button in (select_button, zoom_button):
+                button.IsEnabled = False
+                button.ToolTip = (
+                    "In the linked model '{}' - open that model to select "
+                    "it.".format(record["link"])
+                )
+        else:
+            select_button.ToolTip = "Select this element in Revit"
+            zoom_button.ToolTip = "Zoom the active view to this element"
+            select_button.Click += self.focus_handler(record, False)
+            zoom_button.Click += self.focus_handler(record, True)
+
+        for column, element in enumerate(
+                (details, overlap, select_button, zoom_button)):
+            Grid.SetColumn(element, column)
+            grid.Children.Add(element)
+        card.Child = grid
+        return card
+
+    def make_internal_row(self, item):
+        """One tray-to-tray crossing with too little vertical separation."""
+        first, second, separation, needed = item
+        card = Border()
+        card.Style = self.FindResource("RowCardBad")
+        grid = Grid()
+        for spec in (GridLength(1, GridUnitType.Star), GridLength(210)):
+            column = ColumnDefinition()
+            column.Width = spec
+            grid.ColumnDefinitions.Add(column)
+
+        details = StackPanel()
+        title = TextBlock()
+        title.Style = self.FindResource("RowTitle")
+        title.Text = u"{}  x  {}".format(
+            describe_segment(first), describe_segment(second)
+        )
+        meta = TextBlock()
+        meta.Style = self.FindResource("RowMeta")
+        meta.Text = "Both planned by this tool - they cross in plan."
+        details.Children.Add(title)
+        details.Children.Add(meta)
+
+        numbers = TextBlock()
+        numbers.Style = self.FindResource("RowBad")
+        numbers.Text = "{:.0f} mm apart, {:.0f} mm needed ({:.0f} mm short)".format(
+            internal_to_mm(separation), internal_to_mm(needed),
+            internal_to_mm(needed - separation)
+        )
+
+        for column, element in enumerate((details, numbers)):
+            Grid.SetColumn(element, column)
+            grid.Children.Add(element)
+        card.Child = grid
+        return card
+
+    @staticmethod
+    def piece_labels(pieces, limit=3):
+        labels = [describe_segment(piece) for piece in pieces[:limit]]
+        if len(pieces) > limit:
+            labels.append("+{} more".format(len(pieces) - limit))
+        return ", ".join(labels)
+
+    # ----- buttons ------------------------------------------------------------
+    def focus_handler(self, record, zoom):
+        def handler(sender, args):
+            self.focus_element(record, zoom)
+        return handler
+
+    def focus_element(self, record, zoom):
+        """Select (and optionally zoom to) the clashing element in Revit."""
+        try:
+            element_ids = List[DB.ElementId]()
+            element_ids.Add(record["element"].Id)
+            uidoc.Selection.SetElementIds(element_ids)
+            if zoom:
+                uidoc.ShowElements(record["element"].Id)
+            self.tbServiceStatus.Text = (
+                "{} (ID {}) {} in Revit - this window is in the way, move or "
+                "close it to look.".format(
+                    record["name"], record["id"],
+                    "zoomed to and selected" if zoom else "selected"
+                )
+            )
+        except Exception as error:
+            self.tbServiceStatus.Text = (
+                "Revit could not show ID {}: {}".format(record["id"], error)
+            )
+
+    def report_text(self):
+        """The whole preview as text, for the clipboard."""
+        lines = preview_lines(
+            self.plan, self.values, self.internal, self.clashes,
+            self.clearance_mm, self.include_links
+        )
+        lines.append("")
+        lines.append("EXISTING SERVICES ({}, {:g} mm clearance, linked "
+                     "models {})".format(
+                         len(self.clashes), self.clearance_mm,
+                         "included" if self.include_links
+                         else "not checked"))
+        if not self.clashes:
+            lines.append("  none")
+        for record in self.clashes:
+            lines.append(
+                u"  - {} {} (ID {}{}): overlap {}, {} tray piece(s): "
+                u"{}".format(
+                    record["category"], record["name"], record["id"],
+                    u", in {}".format(record["link"]) if record["link"]
+                    else "", describe_overlap(record["overlap"]),
+                    len(record["pieces"]),
+                    self.piece_labels(record["pieces"], 6)
+                )
+            )
+        lines.append("")
+        lines.append("TRAY CROSSINGS ({})".format(len(self.internal)))
+        if not self.internal:
+            lines.append("  none")
+        for first, second, separation, needed in self.internal:
+            lines.append(
+                "  - {} x {}: {:.0f} mm apart, {:.0f} mm needed".format(
+                    describe_segment(first), describe_segment(second),
+                    internal_to_mm(separation), internal_to_mm(needed)
+                )
+            )
+        return "\n".join(lines)
+
+    def on_recheck(self, sender, args):
+        """Run the service check again with the clearance / link choice."""
+        try:
+            clearance = float(self.tbServiceClearance.Text.strip())
+        except ValueError:
+            self.tbServiceStatus.Text = "Clearance must be a number in mm."
+            return
+        if math.isnan(clearance) or math.isinf(clearance) or clearance < 0:
+            self.tbServiceStatus.Text = "Clearance must be 0 mm or more."
+            return
+        include_links = self.cbIncludeLinks.IsChecked == True
+        try:
+            self.clashes = service_clashes(
+                self.segments, clearance, include_links
+            )
+        except Exception as error:
+            self.tbServiceStatus.Text = "The check failed: {}".format(error)
+            return
+        self.clearance_mm = clearance
+        self.include_links = include_links
+        PREVIEW_STATE["clearance"] = clearance
+        PREVIEW_STATE["links"] = include_links
+        self.refresh()
+        self.tabServices.IsSelected = True
+
+    def on_copy(self, sender, args):
+        try:
+            Clipboard.SetText(self.report_text())
+            self.tbServiceStatus.Text = "Report copied to the clipboard."
+        except Exception as error:
+            self.tbServiceStatus.Text = (
+                "Could not copy the report: {}".format(error)
+            )
+
+    def on_create(self, sender, args):
+        self.choice = "create"
+        self.Close()
+
+    def on_edit(self, sender, args):
+        self.choice = "edit"
+        self.Close()
+
+    def on_cancel(self, sender, args):
+        self.choice = "cancel"
+        self.Close()
+
+
+def show_clash_preview(plan, values):
+    """Run the clash checks and show the preview.
+
+    Returns 'create', 'edit' (go back to the settings dialog) or 'cancel'."""
+    segments = plan["segments"]
+    internal = internal_crossings(segments)
+    clearance_mm = PREVIEW_STATE["clearance"]
+    include_links = PREVIEW_STATE["links"]
+    try:
+        clashes = service_clashes(segments, clearance_mm, include_links)
+    except Exception:
+        # A link that cannot be read must not stop the preview.
+        include_links = False
+        PREVIEW_STATE["links"] = False
+        clashes = service_clashes(segments, clearance_mm, False)
+    window = ClashPreviewWindow(
+        plan, values, internal, clashes, clearance_mm, include_links
+    )
+    window.ShowDialog()
+    return window.choice
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 # ---- 1. What is loaded in the project -----------------------------------------
@@ -3672,7 +4617,9 @@ CANCEL_CHOICE = "Cancel"
 RECHECK_TEXT = u"Re-check and continue  →"
 
 plan = None
-for attempt in range(8):
+# Each pass: check the dimensions, then show the clash preview. "Back to
+# settings" in either dialog comes round again, so the budget covers both.
+for attempt in range(12):
     outcome = evaluate(values, probe)
     if outcome["fatal"]:
         choice = forms.alert(
@@ -3704,7 +4651,16 @@ for attempt in range(8):
             continue
         raise SystemExit
     plan = outcome["plan"]
-    break
+
+    # ---- 5. Tabbed clash preview (read-only) -------------------------------
+    choice = show_clash_preview(plan, values)
+    if choice == "create":
+        break
+    if choice == "edit":
+        values = run_form(values_to_settings(values), RECHECK_TEXT, values)
+        plan = None
+        continue
+    raise SystemExit
 
 if plan is None:
     forms.alert(
@@ -3723,118 +4679,14 @@ crossing = plan["crossing"]
 segments = plan["segments"]
 tee_plans = plan["tee_plans"]
 
-# ---- 5. Clash preview (read-only) ------------------------------------------------
-internal = internal_crossings(segments)
-existing = service_clashes(segments)
+# ---- 5b. Values the creation step needs (the preview above was confirmed) -----
 offset_tees = [item for item in tee_plans if abs(item["lift"]) > EPSILON]
-
 reference_level = project_levels[values["level_index"]]
-# Token values shared by every element - also the example shown below and
-# the starting point for each element's own comment.
+# Token values shared by every element - also the example shown in the
+# preview and the starting point for each element's own comment.
 comment_base = base_comment_tokens(
     values, tray_type, reference_level, tee_symbol
 )
-preview = [
-    "Planned: {} tray piece(s) on {} detail line(s), {} size(s) x {} "
-    "tier(s).".format(len(segments), len(references), len(sizes),
-                      values["tiers"]),
-    "1st tier: {} at {} FFL {:+g} mm (tier gap {:g} mm).".format(
-        REFERENCE_NAMES[values["reference"]], reference_level.Name,
-        values["ffl_offset"], values["tier_spacing"]
-    ),
-]
-if corner_count:
-    corner_leg = max(plan["corner_legs"] or [0.0])
-    preview.append(
-        "Corners: {} - a horizontal bend per lane and tier{}.".format(
-            corner_count,
-            " (bend leg {:.0f} mm)".format(internal_to_mm(corner_leg))
-            if corner_leg > EPSILON else ""
-        )
-    )
-if tee_nodes:
-    preview.append("Tee fitting: {}".format(fitting_type_name(tee_symbol)))
-    for index, size in enumerate(sizes):
-        fit = plan["fits"][index]
-        line = "  {:g}x{:g}: tee reach {:.0f} mm (main) / {:.0f} mm (branch)".format(
-            size[0], size[1],
-            internal_to_mm(fit["main_arm"]), internal_to_mm(fit["branch_arm"])
-        )
-        if fit["bend_leg"] > EPSILON:
-            line += ", vertical bend {:.0f} mm".format(
-                internal_to_mm(fit["bend_leg"])
-            )
-        preview.append(line)
-    if crossing["enabled"]:
-        preview.append(
-            "Tee junctions: {} - {} lane tee(s) offset {} by {:g} mm per "
-            "level ({:g} deg bends, {:g} mm clearance).".format(
-                len(tee_nodes), len(offset_tees),
-                DIRECTION_NAMES[crossing["mode"]],
-                values["step"], values["angle"], values["clearance"]
-            )
-        )
-    else:
-        preview.append(
-            "Tee junctions: {} - crossing offsets are OFF.".format(
-                len(tee_nodes)
-            )
-        )
-if values.get("comments_on"):
-    preview.append(
-        u'Comments on {}: "{}" (first tray; tokens change per element, '
-        u'existing text {}).'.format(
-            COMMENT_TARGET_NAMES[values["comments_target"]],
-            format_comment(values["comments_text"], comment_base),
-            COMMENT_MODE_NAMES[values["comments_mode"]]
-        )
-    )
-else:
-    preview.append("Comments: not written.")
-preview.append("")
-if internal:
-    preview.append(
-        "{} tray-to-tray crossing(s) WITHOUT enough vertical clearance:".format(
-            len(internal)
-        )
-    )
-    for first, second, separation, needed in internal[:10]:
-        preview.append("  - {} x {}: {:.0f} mm apart, {:.0f} mm needed".format(
-            describe_segment(first), describe_segment(second),
-            internal_to_mm(separation), internal_to_mm(needed)
-        ))
-    if len(internal) > 10:
-        preview.append("  ... and {} more.".format(len(internal) - 10))
-else:
-    preview.append("Tray-to-tray check: no crossings without clearance.")
-preview.append("")
-if existing:
-    preview.append(
-        "{} possible clash(es) with existing services (bounding box):".format(
-            len(existing)
-        )
-    )
-    for proposed_item, element in existing[:10]:
-        category = element.Category.Name if element.Category else "Service"
-        preview.append("  - {} overlaps {} (ID {})".format(
-            describe_segment(proposed_item), category,
-            element_id_value(element.Id)
-        ))
-    if len(existing) > 10:
-        preview.append("  ... and {} more.".format(len(existing) - 10))
-else:
-    preview.append("Existing services check: no bounding-box overlaps.")
-preview.append("")
-preview.append("Create the cable trays?")
-
-if not forms.alert(
-    "\n".join(preview),
-    title="Cable Tray Clash Preview",
-    yes=True,
-    no=True,
-    warn_icon=bool(internal or existing)
-):
-    raise SystemExit
 
 # ---- 6. Create everything (MODIFIES THE MODEL) ---------------------------------
 created_segments = []
