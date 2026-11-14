@@ -9,8 +9,9 @@ __doc__ = (
     "Comments text - with tokens such as {size}, {tier} and {level} - is "
     "written on every tray and fitting the tool creates. A tabbed preview "
     "lists every clash with existing services - linked models included - "
-    "before anything is placed, and shows the whole run in a 3D view you "
-    "can orbit."
+    "before anything is placed, and shows the run in a 3D view you can "
+    "orbit, with the MEP services of this model and of the linked files "
+    "drawn around it."
 )
 
 # =============================================================================
@@ -44,16 +45,21 @@ __doc__ = (
 #   6. A tabbed clash PREVIEW is shown BEFORE anything is created:
 #        - 3D preview      : the planned trays drawn in a WPF 3D view
 #          (orbit / pan / zoom with the mouse). Trays that clash turn
-#          orange, the existing services show as red boxes and the
-#          overlapping volume itself is drawn solid, so a clash can be
-#          seen in space and not just read in a list. Nothing is drawn
-#          in the Revit model - it is all in the dialog.
+#          orange, clashing services are red boxes and the overlapping
+#          volume itself is drawn solid. The MEP services around the
+#          route - ducts, pipes, conduit and other cable trays, from
+#          THIS model and from the LINKED files - are drawn in their
+#          category colours, so the route can be read in context.
+#          Nothing is drawn in the Revit model - it is all in the
+#          dialog, and linked elements are only ever read.
 #        - Overview        : what will be created, tee by tee
-#        - Existing services: every bounding-box overlap with ducts,
-#          pipes, conduit and other cable trays - in this model and, if
-#          asked, in the linked models. Each row can be selected or
-#          zoomed to in Revit, and the check can be re-run with a
-#          different clearance without leaving the window.
+#        - Existing services: every bounding-box overlap with the MEP
+#          already modelled - duct, pipe, conduit, tray, their
+#          fittings, accessories and insulation, sprinklers, plumbing
+#          fixtures and plant (SERVICE_CATEGORY_NAMES lists the lot) -
+#          in this model and in the linked files. Each row can be
+#          selected or zoomed to in Revit, and the check can be re-run
+#          with a different clearance without leaving the window.
 #        - Tray crossings  : planned trays that cross each other
 #          without enough vertical separation.
 #      From there you can create, go back to the settings, or cancel.
@@ -457,18 +463,49 @@ def tee_junctions(line_segments):
 # =============================================================================
 # Clash checks (read-only)
 # =============================================================================
-# Existing services the planned trays are checked against.
-SERVICE_CATEGORIES = (
-    DB.BuiltInCategory.OST_CableTray,
-    DB.BuiltInCategory.OST_CableTrayFitting,
-    DB.BuiltInCategory.OST_Conduit,
-    DB.BuiltInCategory.OST_ConduitFitting,
-    DB.BuiltInCategory.OST_DuctCurves,
-    DB.BuiltInCategory.OST_DuctFitting,
-    DB.BuiltInCategory.OST_FlexDuctCurves,
-    DB.BuiltInCategory.OST_PipeCurves,
-    DB.BuiltInCategory.OST_PipeFitting,
-    DB.BuiltInCategory.OST_FlexPipeCurves,
+# Every MEP category the planned trays are checked against and drawn with,
+# and the kind each is coloured as in the 3D preview. Insulation and
+# accessories are in the list on purpose: an insulated duct clashes where the
+# bare duct does not. Named as strings and looked up with getattr, because a
+# category that one Revit version does not have must not stop the script.
+SERVICE_CATEGORY_NAMES = (
+    # Cable tray and conduit
+    ("OST_CableTray", "tray"),
+    ("OST_CableTrayFitting", "tray"),
+    ("OST_Conduit", "conduit"),
+    ("OST_ConduitFitting", "conduit"),
+    # Ductwork
+    ("OST_DuctCurves", "duct"),
+    ("OST_DuctFitting", "duct"),
+    ("OST_FlexDuctCurves", "duct"),
+    ("OST_DuctAccessory", "duct"),
+    ("OST_DuctInsulations", "duct"),
+    ("OST_DuctLinings", "duct"),
+    ("OST_DuctTerminal", "duct"),
+    # Pipework
+    ("OST_PipeCurves", "pipe"),
+    ("OST_PipeFitting", "pipe"),
+    ("OST_FlexPipeCurves", "pipe"),
+    ("OST_PipeAccessory", "pipe"),
+    ("OST_PipeInsulations", "pipe"),
+    ("OST_Sprinklers", "pipe"),
+    ("OST_PlumbingFixtures", "pipe"),
+    # Plant and equipment
+    ("OST_MechanicalEquipment", "equipment"),
+    ("OST_ElectricalEquipment", "equipment"),
+    ("OST_ElectricalFixtures", "equipment"),
+    ("OST_LightingFixtures", "equipment"),
+    ("OST_PlumbingEquipment", "equipment"),
+)
+
+SERVICE_CATEGORY_KINDS = tuple(
+    (getattr(DB.BuiltInCategory, name), kind)
+    for name, kind in SERVICE_CATEGORY_NAMES
+    if getattr(DB.BuiltInCategory, name, None) is not None
+)
+
+SERVICE_CATEGORIES = tuple(
+    category for category, _ in SERVICE_CATEGORY_KINDS
 )
 
 DEFAULT_SERVICE_CLEARANCE_MM = 1.0   # the preview starts hard up against
@@ -521,7 +558,7 @@ def collect_service_boxes(source_doc, link_name=None, transform=None):
     """Bounding boxes of the services in one document, host coordinates."""
     boxes = []
     seen_ids = set()
-    for category in SERVICE_CATEGORIES:
+    for category, kind in SERVICE_CATEGORY_KINDS:
         try:
             elements = (
                 DB.FilteredElementCollector(source_doc)
@@ -553,6 +590,7 @@ def collect_service_boxes(source_doc, link_name=None, transform=None):
                 "min": minimum,
                 "max": maximum,
                 "link": link_name,
+                "kind": kind,
                 "category": element_category_name(element),
                 "name": element_type_name(element),
             })
@@ -3772,7 +3810,8 @@ def run_form(settings, button_text, previous=None):
 # session, so going back to the settings and returning does not reset it.
 PREVIEW_STATE = {
     "clearance": DEFAULT_SERVICE_CLEARANCE_MM,
-    "links": False,
+    "links": True,              # other disciplines usually live in the links
+    "service_view": "near",     # none / clash / near / all
 }
 
 MAX_PREVIEW_ROWS = 200      # keeps the window responsive on busy models
@@ -3808,6 +3847,25 @@ CLASH_XAML = """
       <Setter Property="Padding" Value="8,0"/>
       <Setter Property="VerticalContentAlignment" Value="Center"/>
       <Setter Property="BorderBrush" Value="#CBD5E1"/>
+    </Style>
+    <Style TargetType="ComboBox">
+      <Setter Property="Height" Value="28"/>
+      <Setter Property="Padding" Value="8,0"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+      <Setter Property="FontSize" Value="11.5"/>
+    </Style>
+    <Style x:Key="Swatch" TargetType="Border">
+      <Setter Property="Width" Value="11"/>
+      <Setter Property="Height" Value="11"/>
+      <Setter Property="CornerRadius" Value="3"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+      <Setter Property="Margin" Value="0,0,4,0"/>
+    </Style>
+    <Style x:Key="SwatchText" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="10.5"/>
+      <Setter Property="Foreground" Value="#475569"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+      <Setter Property="Margin" Value="0,0,11,0"/>
     </Style>
     <Style TargetType="TabControl">
       <Setter Property="Background" Value="Transparent"/>
@@ -3996,28 +4054,37 @@ CLASH_XAML = """
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
-              <StackPanel Grid.Column="0" Orientation="Horizontal"
-                          VerticalAlignment="Center">
-                <Border Width="12" Height="12" CornerRadius="3"
-                        Background="#2563EB" VerticalAlignment="Center"/>
-                <TextBlock Text="tray" Margin="5,0,12,0" FontSize="11"
-                           Foreground="#475569" VerticalAlignment="Center"/>
-                <Border Width="12" Height="12" CornerRadius="3"
-                        Background="#F97316" VerticalAlignment="Center"/>
-                <TextBlock Text="tray in a clash" Margin="5,0,12,0"
-                           FontSize="11" Foreground="#475569"
-                           VerticalAlignment="Center"/>
-                <Border Width="12" Height="12" CornerRadius="3"
-                        Background="#EF4444" Opacity="0.45"
-                        VerticalAlignment="Center"/>
-                <TextBlock Text="existing service" Margin="5,0,12,0"
-                           FontSize="11" Foreground="#475569"
-                           VerticalAlignment="Center"/>
-                <Border Width="12" Height="12" CornerRadius="3"
-                        Background="#B91C1C" VerticalAlignment="Center"/>
-                <TextBlock Text="overlap" Margin="5,0,0,0" FontSize="11"
-                           Foreground="#475569" VerticalAlignment="Center"/>
-              </StackPanel>
+              <WrapPanel Grid.Column="0" VerticalAlignment="Center"
+                         Margin="0,0,10,0">
+                <Border Style="{StaticResource Swatch}" Background="#2563EB"/>
+                <TextBlock Text="new tray" Style="{StaticResource SwatchText}"/>
+                <Border Style="{StaticResource Swatch}" Background="#F97316"/>
+                <TextBlock Text="new tray in a clash"
+                           Style="{StaticResource SwatchText}"/>
+                <Border Style="{StaticResource Swatch}" Background="#B91C1C"/>
+                <TextBlock Text="overlap" Style="{StaticResource SwatchText}"/>
+                <Border Style="{StaticResource Swatch}" Background="#EF4444"
+                        Opacity="0.5"/>
+                <TextBlock Text="service in a clash"
+                           Style="{StaticResource SwatchText}"/>
+                <Border Style="{StaticResource Swatch}" Background="#0D9488"
+                        Opacity="0.5"/>
+                <TextBlock Text="duct" Style="{StaticResource SwatchText}"/>
+                <Border Style="{StaticResource Swatch}" Background="#16A34A"
+                        Opacity="0.5"/>
+                <TextBlock Text="pipe" Style="{StaticResource SwatchText}"/>
+                <Border Style="{StaticResource Swatch}" Background="#D97706"
+                        Opacity="0.5"/>
+                <TextBlock Text="conduit" Style="{StaticResource SwatchText}"/>
+                <Border Style="{StaticResource Swatch}" Background="#9333EA"
+                        Opacity="0.5"/>
+                <TextBlock Text="existing tray"
+                           Style="{StaticResource SwatchText}"/>
+                <Border Style="{StaticResource Swatch}" Background="#6366F1"
+                        Opacity="0.5"/>
+                <TextBlock Text="equipment"
+                           Style="{StaticResource SwatchText}"/>
+              </WrapPanel>
               <StackPanel Grid.Column="1" Orientation="Horizontal">
                 <Button x:Name="btnViewIso" Content="Iso"
                         Style="{StaticResource SmallButton}"/>
@@ -4040,18 +4107,27 @@ CLASH_XAML = """
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
               <TextBlock x:Name="tb3dStatus" Grid.Column="0"
                          Style="{StaticResource Hint}"
                          VerticalAlignment="Center" Margin="0,0,14,0"/>
-              <CheckBox x:Name="cbShowServices" Grid.Column="1"
+              <ComboBox x:Name="cbServiceView" Grid.Column="1" Width="196"
+                        Margin="0,0,12,0"
+                        ToolTip="How much of the existing MEP to draw around the new trays. 'Near the route' keeps everything within 3 m of the planned trays - usually the right amount to coordinate against.">
+                <ComboBoxItem Content="Services: none" Tag="none"/>
+                <ComboBoxItem Content="Services: clashing only" Tag="clash"/>
+                <ComboBoxItem Content="Services: near the route" Tag="near"/>
+                <ComboBoxItem Content="Services: whole model" Tag="all"/>
+              </ComboBox>
+              <CheckBox x:Name="cbLinks3d" Grid.Column="2"
                         VerticalAlignment="Center" Margin="0,0,12,0"
-                        VerticalContentAlignment="Center" IsChecked="True"
-                        ToolTip="Draw the clashing existing services as see-through boxes.">
-                <TextBlock Text="Services" Foreground="#334155"
+                        VerticalContentAlignment="Center"
+                        ToolTip="Include the MEP in the loaded linked files, both in the drawing and in the clash check. Same switch as on the Existing services tab.">
+                <TextBlock Text="Linked files" Foreground="#334155"
                            FontWeight="SemiBold"/>
               </CheckBox>
-              <CheckBox x:Name="cbShowOverlaps" Grid.Column="2"
+              <CheckBox x:Name="cbShowOverlaps" Grid.Column="3"
                         VerticalAlignment="Center"
                         VerticalContentAlignment="Center" IsChecked="True"
                         ToolTip="Draw the volume each tray and service share - the clash itself.">
@@ -4176,6 +4252,31 @@ VIEW_COLOURS = {
     "overlap": (255, 185, 28, 28),      # the overlapping volume itself
 }
 
+# Existing MEP services drawn around the route, by kind. They are
+# see-through (low alpha) so the planned trays stay readable through them.
+# Keep in step with the legend swatches in CLASH_XAML.
+SERVICE_VIEW_COLOURS = {
+    "duct": (95, 13, 148, 136),
+    "pipe": (95, 22, 163, 74),
+    "conduit": (95, 217, 119, 6),
+    "tray": (95, 147, 51, 234),
+    "equipment": (95, 99, 102, 241),
+    "other": (95, 100, 116, 139),
+}
+
+# "Near the route" keeps the services within this much of the planned trays.
+NEAR_ROUTE_MARGIN_MM = 3000.0
+
+# Drawing every service in a large federated model would stall the window.
+MAX_SERVICE_BOXES = 4000
+
+SERVICE_VIEW_NAMES = {
+    "none": "no existing services",
+    "clash": "only the services that clash",
+    "near": "the services near the route",
+    "all": "every service in the model and links",
+}
+
 # Azimuth / elevation in degrees for the view buttons.
 PRESET_VIEWS = {
     "iso": (35.0, 26.0),
@@ -4281,6 +4382,20 @@ def overlap_corners(segment, service_min, service_max, clearance_mm):
         if high[axis] - low[axis] <= EPSILON:
             return None
     return axis_box_corners(low, high)
+
+
+def boxes_in_range(boxes, low, high, margin):
+    """The service boxes within 'margin' feet of a box around the route."""
+    near = []
+    for box in boxes:
+        if (box["min"].X > high[0] + margin or box["max"].X < low[0] - margin
+                or box["min"].Y > high[1] + margin
+                or box["max"].Y < low[1] - margin
+                or box["min"].Z > high[2] + margin
+                or box["max"].Z < low[2] - margin):
+            continue
+        near.append(box)
+    return near
 
 
 def add_box(mesh, corners):
@@ -4399,8 +4514,12 @@ class ClashPreviewWindow(forms.WPFWindow):
     """Tabbed preview of the planned trays and everything they clash with."""
 
     def __init__(self, plan, values, internal, clashes, clearance_mm,
-                 include_links):
+                 include_links, boxes=None):
         forms.WPFWindow.__init__(self, CLASH_XAML, literal_string=True)
+        # Collected service boxes, kept per linked-files choice so toggling
+        # the drawing does not read the model again.
+        self.box_cache = {} if boxes is None else {bool(include_links): boxes}
+        self.syncing = False
         self.plan = plan
         self.values = values
         self.segments = plan["segments"]
@@ -4430,10 +4549,21 @@ class ClashPreviewWindow(forms.WPFWindow):
         self.brd3d.MouseRightButtonUp += self.on_view_up
         self.brd3d.MouseMove += self.on_view_move
         self.brd3d.MouseWheel += self.on_view_wheel
-        self.cbShowServices.Checked += self.on_view_option
-        self.cbShowServices.Unchecked += self.on_view_option
         self.cbShowOverlaps.Checked += self.on_view_option
         self.cbShowOverlaps.Unchecked += self.on_view_option
+        self.cbLinks3d.IsChecked = include_links
+        for index in range(self.cbServiceView.Items.Count):
+            if (str(self.cbServiceView.Items[index].Tag)
+                    == PREVIEW_STATE["service_view"]):
+                self.cbServiceView.SelectedIndex = index
+                break
+        if self.cbServiceView.SelectedIndex < 0:
+            self.cbServiceView.SelectedIndex = 2        # near the route
+        self.cbServiceView.SelectionChanged += self.on_service_view_changed
+        self.cbIncludeLinks.Checked += self.on_links_changed
+        self.cbIncludeLinks.Unchecked += self.on_links_changed
+        self.cbLinks3d.Checked += self.on_links_changed
+        self.cbLinks3d.Unchecked += self.on_links_changed
         for button, preset in ((self.btnViewIso, "iso"),
                                (self.btnViewTop, "top"),
                                (self.btnViewFront, "front"),
@@ -4662,11 +4792,15 @@ class ClashPreviewWindow(forms.WPFWindow):
             meshes = {}
             for key in ("tray", "hit", "service", "overlap"):
                 meshes[key] = MeshGeometry3D()
+            for kind in SERVICE_VIEW_COLOURS:
+                meshes["service_" + kind] = MeshGeometry3D()
             # Every tray piece that any clash record points at turns orange.
             hit_pieces = set()
             for record in self.clashes:
                 for piece in record["pieces"]:
                     hit_pieces.add(id(piece))
+            # Only the new trays and the clashes set the camera; the MEP
+            # drawn around them must not pull the view away from the route.
             corner_cloud = []
             for segment in self.segments:
                 corners = segment_corners(segment)
@@ -4677,11 +4811,11 @@ class ClashPreviewWindow(forms.WPFWindow):
                     corners
                 )
                 corner_cloud.extend(corners)
-            show_services = self.cbShowServices.IsChecked == True
+            view_mode = self.current_service_view()
             show_overlaps = self.cbShowOverlaps.IsChecked == True
             overlap_count = 0
             for record in self.clashes:
-                if show_services:
+                if view_mode != "none":
                     corners = axis_box_corners(
                         point_tuple(record["min"]), point_tuple(record["max"])
                     )
@@ -4699,6 +4833,41 @@ class ClashPreviewWindow(forms.WPFWindow):
                     corner_cloud.extend(corners)
                     overlap_count += 1
 
+            # The MEP already in the model (and in the linked files), drawn
+            # in its category colours for context.
+            context_count = 0
+            link_count = 0
+            capped = False
+            if view_mode in ("near", "all") and corner_cloud:
+                low = [min(corner[axis] for corner in corner_cloud)
+                       for axis in range(3)]
+                high = [max(corner[axis] for corner in corner_cloud)
+                        for axis in range(3)]
+                clash_keys = set(
+                    (record["link"], record["id"]) for record in self.clashes
+                )
+                context = self.cached_service_boxes()
+                if view_mode == "near":
+                    context = boxes_in_range(
+                        context, low, high,
+                        mm_to_internal(NEAR_ROUTE_MARGIN_MM)
+                    )
+                for box in context:
+                    if (box["link"], box["id"]) in clash_keys:
+                        continue            # already drawn in red
+                    if context_count >= MAX_SERVICE_BOXES:
+                        capped = True
+                        break
+                    kind = box["kind"]
+                    if kind not in SERVICE_VIEW_COLOURS:
+                        kind = "other"
+                    add_box(meshes["service_" + kind], axis_box_corners(
+                        point_tuple(box["min"]), point_tuple(box["max"])
+                    ))
+                    context_count += 1
+                    if box["link"]:
+                        link_count += 1
+
             group = Model3DGroup()
             group.Children.Add(AmbientLight(
                 Color.FromArgb(255, 110, 110, 118)
@@ -4712,10 +4881,18 @@ class ClashPreviewWindow(forms.WPFWindow):
                 Vector3D(1.6, 1.0, 0.6)
             ))
             # See-through services go in first, opaque boxes on top.
-            for key in ("service", "tray", "hit", "overlap"):
-                if meshes[key].Positions.Count:
-                    group.Children.Add(shaded_model(meshes[key],
-                                                    VIEW_COLOURS[key]))
+            draw_order = [
+                "service_" + kind for kind in sorted(SERVICE_VIEW_COLOURS)
+            ] + ["service", "tray", "hit", "overlap"]
+            for key in draw_order:
+                mesh = meshes[key]
+                if not mesh.Positions.Count:
+                    continue
+                colour = (
+                    SERVICE_VIEW_COLOURS[key[8:]] if key.startswith("service_")
+                    else VIEW_COLOURS[key]
+                )
+                group.Children.Add(shaded_model(mesh, colour))
 
             # Centre the whole thing on the origin and scale it to a fixed
             # size, so one camera distance suits any size of job.
@@ -4725,11 +4902,16 @@ class ClashPreviewWindow(forms.WPFWindow):
             self.vp3d.Children.Add(visual)
             self.update_camera()
             self.tb3dStatus.Text = (
-                "{} tray piece(s), {} in a clash  |  {} service box(es), {} "
-                "overlap(s)  |  drag to orbit, right-drag to pan, wheel to "
-                "zoom.".format(
+                "{} new tray piece(s), {} in a clash  |  {} clashing "
+                "service(s), {} overlap(s)  |  {} other service(s) drawn{}{}"
+                "  |  drag to orbit, right-drag to pan, wheel to zoom.".format(
                     len(self.segments), len(hit_pieces),
-                    len(self.clashes) if show_services else 0, overlap_count
+                    len(self.clashes) if view_mode != "none" else 0,
+                    overlap_count, context_count,
+                    " ({} from links)".format(link_count)
+                    if link_count else "",
+                    ", capped at {}".format(MAX_SERVICE_BOXES)
+                    if capped else ""
                 )
             )
         except Exception as error:
@@ -4792,6 +4974,57 @@ class ClashPreviewWindow(forms.WPFWindow):
 
     def on_view_option(self, sender, args):
         self.build_scene()
+
+    def current_service_view(self):
+        """none / clash / near / all - how much existing MEP to draw."""
+        item = self.cbServiceView.SelectedItem
+        return str(item.Tag) if item is not None else "near"
+
+    def on_service_view_changed(self, sender, args):
+        if self.syncing:
+            return
+        PREVIEW_STATE["service_view"] = self.current_service_view()
+        self.build_scene()
+
+    def on_links_changed(self, sender, args):
+        """The two 'linked files' boxes are one setting - keep them in step."""
+        if self.syncing:
+            return
+        wanted = sender.IsChecked == True
+        self.syncing = True
+        try:
+            self.cbIncludeLinks.IsChecked = wanted
+            self.cbLinks3d.IsChecked = wanted
+        finally:
+            self.syncing = False
+        self.run_check(wanted, self.clearance_mm)
+
+    def cached_service_boxes(self):
+        """Service boxes for the current linked-files choice, read once."""
+        key = bool(self.include_links)
+        if key not in self.box_cache:
+            self.box_cache[key] = service_boxes(key)
+        return self.box_cache[key]
+
+    def run_check(self, include_links, clearance_mm):
+        """Re-run the clash check, then redraw every tab."""
+        previous = self.include_links
+        self.include_links = include_links
+        try:
+            clashes = service_clashes(
+                self.segments, clearance_mm, include_links,
+                boxes=self.cached_service_boxes()
+            )
+        except Exception as error:
+            self.include_links = previous
+            self.tbServiceStatus.Text = "The check failed: {}".format(error)
+            return False
+        self.clashes = clashes
+        self.clearance_mm = clearance_mm
+        PREVIEW_STATE["clearance"] = clearance_mm
+        PREVIEW_STATE["links"] = include_links
+        self.refresh()
+        return True
 
     def on_view_down(self, sender, args):
         self.drag_mode = (
@@ -4910,20 +5143,8 @@ class ClashPreviewWindow(forms.WPFWindow):
         if math.isnan(clearance) or math.isinf(clearance) or clearance < 0:
             self.tbServiceStatus.Text = "Clearance must be 0 mm or more."
             return
-        include_links = self.cbIncludeLinks.IsChecked == True
-        try:
-            self.clashes = service_clashes(
-                self.segments, clearance, include_links
-            )
-        except Exception as error:
-            self.tbServiceStatus.Text = "The check failed: {}".format(error)
-            return
-        self.clearance_mm = clearance
-        self.include_links = include_links
-        PREVIEW_STATE["clearance"] = clearance
-        PREVIEW_STATE["links"] = include_links
-        self.refresh()
-        self.tabServices.IsSelected = True
+        if self.run_check(self.cbIncludeLinks.IsChecked == True, clearance):
+            self.tabServices.IsSelected = True
 
     def on_copy(self, sender, args):
         try:
@@ -4955,15 +5176,23 @@ def show_clash_preview(plan, values):
     internal = internal_crossings(segments)
     clearance_mm = PREVIEW_STATE["clearance"]
     include_links = PREVIEW_STATE["links"]
+    # Read the services once: the same boxes check for clashes and draw the
+    # MEP around the route.
     try:
-        clashes = service_clashes(segments, clearance_mm, include_links)
+        boxes = service_boxes(include_links)
     except Exception:
         # A link that cannot be read must not stop the preview.
         include_links = False
         PREVIEW_STATE["links"] = False
-        clashes = service_clashes(segments, clearance_mm, False)
+        try:
+            boxes = service_boxes(False)
+        except Exception:
+            boxes = []
+    clashes = service_clashes(
+        segments, clearance_mm, include_links, boxes=boxes
+    )
     window = ClashPreviewWindow(
-        plan, values, internal, clashes, clearance_mm, include_links
+        plan, values, internal, clashes, clearance_mm, include_links, boxes
     )
     window.tab3d.IsSelected = True       # open on the 3D view
     window.ShowDialog()
