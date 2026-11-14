@@ -9,7 +9,8 @@ __doc__ = (
     "Comments text - with tokens such as {size}, {tier} and {level} - is "
     "written on every tray and fitting the tool creates. A tabbed preview "
     "lists every clash with existing services - linked models included - "
-    "before anything is placed."
+    "before anything is placed, and shows the whole run in a 3D view you "
+    "can orbit."
 )
 
 # =============================================================================
@@ -41,6 +42,12 @@ __doc__ = (
 #   5. Tees are inserted with Revit's NewTeeFitting, so Revit picks the tray
 #      type's Tee family and SIZES IT to the trays automatically.
 #   6. A tabbed clash PREVIEW is shown BEFORE anything is created:
+#        - 3D preview      : the planned trays drawn in a WPF 3D view
+#          (orbit / pan / zoom with the mouse). Trays that clash turn
+#          orange, the existing services show as red boxes and the
+#          overlapping volume itself is drawn solid, so a clash can be
+#          seen in space and not just read in a list. Nothing is drawn
+#          in the Revit model - it is all in the dialog.
 #        - Overview        : what will be created, tee by tee
 #        - Existing services: every bounding-box overlap with ducts,
 #          pipes, conduit and other cable trays - in this model and, if
@@ -90,6 +97,14 @@ from System.Windows import (
 from System.Windows.Controls import (
     Border, Button, ColumnDefinition, Grid, RowDefinition, StackPanel,
     TextBlock, TextBox
+)
+# The 3D preview tab draws the planned trays with WPF 3D - no Revit geometry
+# is created for it.
+from System.Windows.Media import Color, SolidColorBrush
+from System.Windows.Media.Media3D import (
+    AmbientLight, DiffuseMaterial, DirectionalLight, GeometryModel3D,
+    MeshGeometry3D, Model3DGroup, ModelVisual3D, PerspectiveCamera, Point3D,
+    ScaleTransform3D, Transform3DGroup, TranslateTransform3D, Vector3D
 )
 
 
@@ -3972,6 +3987,82 @@ CLASH_XAML = """
     <!-- ===== Tabs ===== -->
     <TabControl Grid.Row="1" Margin="20,14,20,0" BorderThickness="0">
 
+      <!-- 3D preview -->
+      <TabItem x:Name="tab3d">
+        <Border Style="{StaticResource Card}">
+          <StackPanel>
+            <Grid Margin="0,0,0,8">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <StackPanel Grid.Column="0" Orientation="Horizontal"
+                          VerticalAlignment="Center">
+                <Border Width="12" Height="12" CornerRadius="3"
+                        Background="#2563EB" VerticalAlignment="Center"/>
+                <TextBlock Text="tray" Margin="5,0,12,0" FontSize="11"
+                           Foreground="#475569" VerticalAlignment="Center"/>
+                <Border Width="12" Height="12" CornerRadius="3"
+                        Background="#F97316" VerticalAlignment="Center"/>
+                <TextBlock Text="tray in a clash" Margin="5,0,12,0"
+                           FontSize="11" Foreground="#475569"
+                           VerticalAlignment="Center"/>
+                <Border Width="12" Height="12" CornerRadius="3"
+                        Background="#EF4444" Opacity="0.45"
+                        VerticalAlignment="Center"/>
+                <TextBlock Text="existing service" Margin="5,0,12,0"
+                           FontSize="11" Foreground="#475569"
+                           VerticalAlignment="Center"/>
+                <Border Width="12" Height="12" CornerRadius="3"
+                        Background="#B91C1C" VerticalAlignment="Center"/>
+                <TextBlock Text="overlap" Margin="5,0,0,0" FontSize="11"
+                           Foreground="#475569" VerticalAlignment="Center"/>
+              </StackPanel>
+              <StackPanel Grid.Column="1" Orientation="Horizontal">
+                <Button x:Name="btnViewIso" Content="Iso"
+                        Style="{StaticResource SmallButton}"/>
+                <Button x:Name="btnViewTop" Content="Top"
+                        Style="{StaticResource SmallButton}"/>
+                <Button x:Name="btnViewFront" Content="Front"
+                        Style="{StaticResource SmallButton}"/>
+                <Button x:Name="btnViewSide" Content="Side"
+                        Style="{StaticResource SmallButton}"/>
+                <Button x:Name="btnViewFit" Content="Fit"
+                        Style="{StaticResource SmallButton}"/>
+              </StackPanel>
+            </Grid>
+            <Border x:Name="brd3d" Background="#0F172A" CornerRadius="8"
+                    Height="392" ClipToBounds="True">
+              <Viewport3D x:Name="vp3d" ClipToBounds="True"/>
+            </Border>
+            <Grid Margin="0,8,0,0">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <TextBlock x:Name="tb3dStatus" Grid.Column="0"
+                         Style="{StaticResource Hint}"
+                         VerticalAlignment="Center" Margin="0,0,14,0"/>
+              <CheckBox x:Name="cbShowServices" Grid.Column="1"
+                        VerticalAlignment="Center" Margin="0,0,12,0"
+                        VerticalContentAlignment="Center" IsChecked="True"
+                        ToolTip="Draw the clashing existing services as see-through boxes.">
+                <TextBlock Text="Services" Foreground="#334155"
+                           FontWeight="SemiBold"/>
+              </CheckBox>
+              <CheckBox x:Name="cbShowOverlaps" Grid.Column="2"
+                        VerticalAlignment="Center"
+                        VerticalContentAlignment="Center" IsChecked="True"
+                        ToolTip="Draw the volume each tray and service share - the clash itself.">
+                <TextBlock Text="Overlaps" Foreground="#334155"
+                           FontWeight="SemiBold"/>
+              </CheckBox>
+            </Grid>
+          </StackPanel>
+        </Border>
+      </TabItem>
+
       <!-- Overview -->
       <TabItem x:Name="tabOverview">
         <Border Style="{StaticResource Card}">
@@ -4066,6 +4157,148 @@ CLASH_XAML = """
   </Grid>
 </Window>
 """
+
+
+# =============================================================================
+# 3D PREVIEW GEOMETRY (WPF 3D - nothing is drawn in the Revit model)
+# =============================================================================
+# Each planned tray piece becomes a box running start -> end, as wide and as
+# tall as the tray, so a sloped offset piece really is sloped in the view.
+# The existing services are drawn as the same bounding boxes the clash check
+# uses, and the overlapping volume between the two is drawn solid: that is
+# the clash, in place, at the right size.
+#
+# Colours (keep in step with the legend swatches in CLASH_XAML).
+VIEW_COLOURS = {
+    "tray": (255, 37, 99, 235),         # planned tray, clear
+    "hit": (255, 249, 115, 22),         # planned tray that clashes
+    "service": (105, 239, 68, 68),      # existing service (see-through)
+    "overlap": (255, 185, 28, 28),      # the overlapping volume itself
+}
+
+# Azimuth / elevation in degrees for the view buttons.
+PRESET_VIEWS = {
+    "iso": (35.0, 26.0),
+    "top": (90.0, 88.0),
+    "front": (0.0, 3.0),
+    "side": (90.0, 3.0),
+}
+
+# Two triangles per face of a box, using the corner order of prism_corners().
+BOX_TRIANGLES = (
+    (0, 1, 5), (0, 5, 4),       # bottom
+    (3, 7, 6), (3, 6, 2),       # top
+    (0, 4, 7), (0, 7, 3),       # one side
+    (1, 2, 6), (1, 6, 5),       # the other side
+    (0, 3, 2), (0, 2, 1),       # start cap
+    (4, 5, 6), (4, 6, 7),       # end cap
+)
+
+
+def media_brush(argb):
+    """SolidColorBrush from an (alpha, red, green, blue) tuple."""
+    return SolidColorBrush(Color.FromArgb(*argb))
+
+
+def vector_cross(first, second):
+    return (first[1] * second[2] - first[2] * second[1],
+            first[2] * second[0] - first[0] * second[2],
+            first[0] * second[1] - first[1] * second[0])
+
+
+def vector_scale(vector, factor):
+    return (vector[0] * factor, vector[1] * factor, vector[2] * factor)
+
+
+def vector_unit(vector):
+    length = math.sqrt(sum(value * value for value in vector))
+    if length <= EPSILON:
+        return None
+    return vector_scale(vector, 1.0 / length)
+
+
+def prism_corners(start, end, normal, up):
+    """The 8 corners of a box running start -> end.
+
+    'normal' and 'up' are the half-width and half-height vectors of the
+    cross-section. Corners 0-3 are the start face, 4-7 the end face, both
+    anticlockwise from -normal -up."""
+    corners = []
+    for point in (start, end):
+        for sign_normal, sign_up in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+            corners.append((
+                point[0] + sign_normal * normal[0] + sign_up * up[0],
+                point[1] + sign_normal * normal[1] + sign_up * up[1],
+                point[2] + sign_normal * normal[2] + sign_up * up[2],
+            ))
+    return corners
+
+
+def axis_box_corners(low, high):
+    """The 8 corners of an axis-aligned box, from two (x, y, z) tuples."""
+    middle_y = (low[1] + high[1]) / 2.0
+    middle_z = (low[2] + high[2]) / 2.0
+    return prism_corners(
+        (low[0], middle_y, middle_z), (high[0], middle_y, middle_z),
+        (0.0, (high[1] - low[1]) / 2.0, 0.0),
+        (0.0, 0.0, (high[2] - low[2]) / 2.0)
+    )
+
+
+def point_tuple(point):
+    return (point.X, point.Y, point.Z)
+
+
+def segment_corners(segment):
+    """Corners of one planned tray piece, in model feet."""
+    start = point_tuple(segment["start"])
+    end = point_tuple(segment["end"])
+    direction = vector_unit((end[0] - start[0], end[1] - start[1],
+                             end[2] - start[2]))
+    if direction is None:
+        return None
+    plan_length = math.sqrt(direction[0] ** 2 + direction[1] ** 2)
+    if plan_length > 1e-6:
+        normal = (direction[1] / plan_length, -direction[0] / plan_length, 0.0)
+    else:
+        normal = (1.0, 0.0, 0.0)        # vertical riser: any side will do
+    up = vector_unit(vector_cross(normal, direction)) or (0.0, 0.0, 1.0)
+    return prism_corners(
+        start, end,
+        vector_scale(normal, mm_to_internal(segment["width"]) / 2.0),
+        vector_scale(up, mm_to_internal(segment["height"]) / 2.0)
+    )
+
+
+def overlap_corners(segment, service_min, service_max, clearance_mm):
+    """Corners of the volume a tray piece and a service box share."""
+    tray_min, tray_max = tray_bounds(segment, mm_to_internal(clearance_mm))
+    low = (max(tray_min.X, service_min.X), max(tray_min.Y, service_min.Y),
+           max(tray_min.Z, service_min.Z))
+    high = (min(tray_max.X, service_max.X), min(tray_max.Y, service_max.Y),
+            min(tray_max.Z, service_max.Z))
+    for axis in range(3):
+        if high[axis] - low[axis] <= EPSILON:
+            return None
+    return axis_box_corners(low, high)
+
+
+def add_box(mesh, corners):
+    """Append one box to a mesh, keeping every other box already in it."""
+    base = mesh.Positions.Count
+    for corner in corners:
+        mesh.Positions.Add(Point3D(corner[0], corner[1], corner[2]))
+    for triangle in BOX_TRIANGLES:
+        for index in triangle:
+            mesh.TriangleIndices.Add(base + index)
+
+
+def shaded_model(mesh, argb):
+    """A mesh painted on both faces, so no box can look inside out."""
+    material = DiffuseMaterial(media_brush(argb))
+    model = GeometryModel3D(mesh, material)
+    model.BackMaterial = material
+    return model
 
 
 def preview_lines(plan, values, internal, clashes, clearance_mm,
@@ -4182,6 +4415,31 @@ class ClashPreviewWindow(forms.WPFWindow):
             pass
         self.tbServiceClearance.Text = "{:g}".format(clearance_mm)
         self.cbIncludeLinks.IsChecked = include_links
+        # 3D view state: orbit angles, zoom, and the point looked at.
+        self.azimuth, self.elevation = PRESET_VIEWS["iso"]
+        self.distance = 24.0
+        self.target = [0.0, 0.0, 0.0]
+        self.drag_mode = None
+        self.drag_origin = None
+        self.camera = PerspectiveCamera()
+        self.camera.FieldOfView = 45.0
+        self.vp3d.Camera = self.camera
+        self.brd3d.MouseLeftButtonDown += self.on_view_down
+        self.brd3d.MouseRightButtonDown += self.on_view_down
+        self.brd3d.MouseLeftButtonUp += self.on_view_up
+        self.brd3d.MouseRightButtonUp += self.on_view_up
+        self.brd3d.MouseMove += self.on_view_move
+        self.brd3d.MouseWheel += self.on_view_wheel
+        self.cbShowServices.Checked += self.on_view_option
+        self.cbShowServices.Unchecked += self.on_view_option
+        self.cbShowOverlaps.Checked += self.on_view_option
+        self.cbShowOverlaps.Unchecked += self.on_view_option
+        for button, preset in ((self.btnViewIso, "iso"),
+                               (self.btnViewTop, "top"),
+                               (self.btnViewFront, "front"),
+                               (self.btnViewSide, "side")):
+            button.Click += self.preset_handler(preset)
+        self.btnViewFit.Click += self.on_view_fit
         self.btnRecheck.Click += self.on_recheck
         self.btnCopy.Click += self.on_copy
         self.btnCreate.Click += self.on_create
@@ -4196,6 +4454,7 @@ class ClashPreviewWindow(forms.WPFWindow):
             self.plan, self.values, self.internal, self.clashes,
             self.clearance_mm, self.include_links
         ))
+        self.tab3d.Header = "3D preview"
         self.tabOverview.Header = "Overview"
         self.tabServices.Header = "Existing services ({})".format(
             len(self.clashes)
@@ -4210,6 +4469,7 @@ class ClashPreviewWindow(forms.WPFWindow):
         self.show_services()
         self.show_internal()
         self.show_verdict()
+        self.build_scene()
 
     def show_verdict(self):
         clear = not self.clashes and not self.internal
@@ -4391,6 +4651,191 @@ class ClashPreviewWindow(forms.WPFWindow):
             labels.append("+{} more".format(len(pieces) - limit))
         return ", ".join(labels)
 
+    # ----- 3D preview ---------------------------------------------------------
+    def build_scene(self):
+        """Draw the planned trays, the clashing services and the overlaps.
+
+        Boxes of one colour share a single mesh, so even a few thousand tray
+        pieces stay one object each to draw."""
+        try:
+            self.vp3d.Children.Clear()
+            meshes = {}
+            for key in ("tray", "hit", "service", "overlap"):
+                meshes[key] = MeshGeometry3D()
+            # Every tray piece that any clash record points at turns orange.
+            hit_pieces = set()
+            for record in self.clashes:
+                for piece in record["pieces"]:
+                    hit_pieces.add(id(piece))
+            corner_cloud = []
+            for segment in self.segments:
+                corners = segment_corners(segment)
+                if corners is None:
+                    continue
+                add_box(
+                    meshes["hit" if id(segment) in hit_pieces else "tray"],
+                    corners
+                )
+                corner_cloud.extend(corners)
+            show_services = self.cbShowServices.IsChecked == True
+            show_overlaps = self.cbShowOverlaps.IsChecked == True
+            overlap_count = 0
+            for record in self.clashes:
+                if show_services:
+                    corners = axis_box_corners(
+                        point_tuple(record["min"]), point_tuple(record["max"])
+                    )
+                    add_box(meshes["service"], corners)
+                    corner_cloud.extend(corners)
+                if not show_overlaps:
+                    continue
+                for piece in record["pieces"]:
+                    corners = overlap_corners(
+                        piece, record["min"], record["max"], self.clearance_mm
+                    )
+                    if corners is None:
+                        continue
+                    add_box(meshes["overlap"], corners)
+                    corner_cloud.extend(corners)
+                    overlap_count += 1
+
+            group = Model3DGroup()
+            group.Children.Add(AmbientLight(
+                Color.FromArgb(255, 110, 110, 118)
+            ))
+            group.Children.Add(DirectionalLight(
+                Color.FromArgb(255, 210, 210, 214),
+                Vector3D(-1.0, -1.4, -2.2)
+            ))
+            group.Children.Add(DirectionalLight(
+                Color.FromArgb(255, 120, 120, 128),
+                Vector3D(1.6, 1.0, 0.6)
+            ))
+            # See-through services go in first, opaque boxes on top.
+            for key in ("service", "tray", "hit", "overlap"):
+                if meshes[key].Positions.Count:
+                    group.Children.Add(shaded_model(meshes[key],
+                                                    VIEW_COLOURS[key]))
+
+            # Centre the whole thing on the origin and scale it to a fixed
+            # size, so one camera distance suits any size of job.
+            self.scene_transform(group, corner_cloud)
+            visual = ModelVisual3D()
+            visual.Content = group
+            self.vp3d.Children.Add(visual)
+            self.update_camera()
+            self.tb3dStatus.Text = (
+                "{} tray piece(s), {} in a clash  |  {} service box(es), {} "
+                "overlap(s)  |  drag to orbit, right-drag to pan, wheel to "
+                "zoom.".format(
+                    len(self.segments), len(hit_pieces),
+                    len(self.clashes) if show_services else 0, overlap_count
+                )
+            )
+        except Exception as error:
+            self.tb3dStatus.Text = (
+                "The 3D preview could not be drawn ({}). The other tabs are "
+                "unaffected.".format(error)
+            )
+
+    def scene_transform(self, group, corner_cloud):
+        """Move the drawing to the origin and scale it to about 10 units."""
+        if not corner_cloud:
+            return
+        lows = [min(corner[axis] for corner in corner_cloud)
+                for axis in range(3)]
+        highs = [max(corner[axis] for corner in corner_cloud)
+                 for axis in range(3)]
+        self.scene_centre = [
+            (lows[axis] + highs[axis]) / 2.0 for axis in range(3)
+        ]
+        extent = max(
+            [highs[axis] - lows[axis] for axis in range(3)] + [EPSILON]
+        )
+        self.scene_scale = 10.0 / extent
+        transform = Transform3DGroup()
+        transform.Children.Add(TranslateTransform3D(
+            -self.scene_centre[0], -self.scene_centre[1],
+            -self.scene_centre[2]
+        ))
+        transform.Children.Add(ScaleTransform3D(
+            self.scene_scale, self.scene_scale, self.scene_scale
+        ))
+        group.Transform = transform
+
+    def update_camera(self):
+        """Put the camera on its orbit around the point being looked at."""
+        azimuth = math.radians(self.azimuth)
+        elevation = math.radians(max(-89.0, min(89.0, self.elevation)))
+        offset = (
+            self.distance * math.cos(elevation) * math.cos(azimuth),
+            self.distance * math.cos(elevation) * math.sin(azimuth),
+            self.distance * math.sin(elevation),
+        )
+        self.camera.Position = Point3D(self.target[0] + offset[0],
+                                       self.target[1] + offset[1],
+                                       self.target[2] + offset[2])
+        self.camera.LookDirection = Vector3D(-offset[0], -offset[1],
+                                             -offset[2])
+        self.camera.UpDirection = Vector3D(0.0, 0.0, 1.0)
+
+    def preset_handler(self, preset):
+        def handler(sender, args):
+            self.azimuth, self.elevation = PRESET_VIEWS[preset]
+            self.update_camera()
+        return handler
+
+    def on_view_fit(self, sender, args):
+        self.distance = 24.0
+        self.target = [0.0, 0.0, 0.0]
+        self.update_camera()
+
+    def on_view_option(self, sender, args):
+        self.build_scene()
+
+    def on_view_down(self, sender, args):
+        self.drag_mode = (
+            "pan" if args.ChangedButton.ToString() == "Right" else "orbit"
+        )
+        self.drag_origin = args.GetPosition(self.brd3d)
+        self.brd3d.CaptureMouse()
+
+    def on_view_up(self, sender, args):
+        self.drag_mode = None
+        self.brd3d.ReleaseMouseCapture()
+
+    def on_view_move(self, sender, args):
+        if self.drag_mode is None or self.drag_origin is None:
+            return
+        position = args.GetPosition(self.brd3d)
+        delta_x = position.X - self.drag_origin.X
+        delta_y = position.Y - self.drag_origin.Y
+        self.drag_origin = position
+        if self.drag_mode == "orbit":
+            self.azimuth = (self.azimuth - delta_x * 0.4) % 360.0
+            self.elevation = max(
+                -89.0, min(89.0, self.elevation + delta_y * 0.4)
+            )
+        else:
+            # Pan across the screen: right is level, up follows the camera.
+            azimuth = math.radians(self.azimuth)
+            elevation = math.radians(self.elevation)
+            right = (-math.sin(azimuth), math.cos(azimuth), 0.0)
+            forward = (-math.cos(elevation) * math.cos(azimuth),
+                       -math.cos(elevation) * math.sin(azimuth),
+                       -math.sin(elevation))
+            up = vector_cross(right, forward)
+            step = self.distance * 0.0016
+            for axis in range(3):
+                self.target[axis] -= right[axis] * delta_x * step
+                self.target[axis] += up[axis] * delta_y * step
+        self.update_camera()
+
+    def on_view_wheel(self, sender, args):
+        factor = 0.88 if args.Delta > 0 else 1.0 / 0.88
+        self.distance = max(1.5, min(240.0, self.distance * factor))
+        self.update_camera()
+
     # ----- buttons ------------------------------------------------------------
     def focus_handler(self, record, zoom):
         def handler(sender, args):
@@ -4520,6 +4965,7 @@ def show_clash_preview(plan, values):
     window = ClashPreviewWindow(
         plan, values, internal, clashes, clearance_mm, include_links
     )
+    window.tab3d.IsSelected = True       # open on the 3D view
     window.ShowDialog()
     return window.choice
 
