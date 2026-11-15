@@ -51,6 +51,18 @@ namespace MyRevitAddin
             };
             panel.AddItem(wallsButton);
 
+            var panelDistanceButton = new PushButtonData(
+                "PanelDistanceCommand",
+                "Panel\nDistance",
+                assemblyPath,
+                typeof(MyRevitCommands.PanelDistanceCommand).FullName)
+            {
+                ToolTip = "Measures cable routes between panels and equipment along cable trays, with voltage drop.",
+                LargeImage = LoadIcon("icon32.png"),
+                Image = LoadIcon("icon16.png"),
+            };
+            panel.AddItem(panelDistanceButton);
+
             return Result.Succeeded;
         }
 
