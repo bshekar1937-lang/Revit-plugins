@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The same check as RevitLayerCheck, with REVIT_ELEMENTID_VALUE left off, so
+    the Revit 2023 branch of ModelReader.IdOf (ElementId.IntegerValue) is
+    compiled too. Both branches have to build, and only one of them does in
+    any single configuration.
+  -->
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>LegacyIdCheck</AssemblyName>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\RevitStub\RevitStub.cs" />
+    <Compile Include="..\..\src\Core\*.cs" />
+    <Compile Include="..\..\src\Revit\*.cs" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Compiles Core and the Revit layer against tests/RevitStub, so the C# in
+    src/Revit is checked by a real compiler on any machine. It is a build-only
+    check: see the header of RevitStub.cs for what it does and does not prove.
+  -->
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>RevitLayerCheck</AssemblyName>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <DefineConstants>$(DefineConstants);REVIT_ELEMENTID_VALUE</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\RevitStub\RevitStub.cs" />
+    <Compile Include="..\..\src\Core\*.cs" />
+    <Compile Include="..\..\src\Revit\*.cs" />
+  </ItemGroup>
+
+</Project>
