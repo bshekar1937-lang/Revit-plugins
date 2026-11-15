@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Put this file in:  %AppData%\Autodesk\Revit\Addins\2024\
+  DELETE your old .addin file that has Type="Command" for Panel Distance,
+  otherwise the button also stays under Add-Ins > External Tools.
+
+  <Assembly> = full path to YOUR built DLL (or a path relative to this file).
+-->
+<RevitAddIns>
+  <AddIn Type="Application">
+    <Name>My Tools</Name>
+    <Assembly>C:\RevitAddins\MyRevitCommands\MyRevitCommands.dll</Assembly>
+    <FullClassName>MyRevitCommands.App</FullClassName>
+    <AddInId>B4F3E2A1-6C5D-4E7F-8A9B-0C1D2E3F4A5B</AddInId>
+    <VendorId>MYTL</VendorId>
+    <VendorDescription>My Tools</VendorDescription>
+  </AddIn>
+</RevitAddIns>
