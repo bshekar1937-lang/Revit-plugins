@@ -777,6 +777,7 @@ namespace MyRevitCommands
                 public long Id;
                 public string Display;
                 public string SearchText;
+                public WpfCheckBox Box; // one tick box per panel; ticking only affects this panel
                 public override string ToString() { return Display; }
             }
 
@@ -788,7 +789,10 @@ namespace MyRevitCommands
             private readonly WpfCheckBox _isolators = Check("Include isolators");
             private readonly WpfCheckBox _draw = Check("Draw red detail lines after measuring (active plan view)");
             private readonly WpfTextBox _search = new WpfTextBox { Padding = new Thickness(6), Margin = new Thickness(0, 4, 0, 6), ToolTip = "Type part of a panel name, mark, ID, category or comment" };
-            private readonly ListBox _panelList = new ListBox { SelectionMode = SelectionMode.Multiple, Height = 190, Margin = new Thickness(0, 0, 0, 6) };
+            // Tick-box list (not a multi-select ListBox): clicking one panel never changes the others.
+            private readonly StackPanel _panelRows = new StackPanel { Margin = new Thickness(6, 4, 6, 4) };
+            private readonly ScrollViewer _panelList = new ScrollViewer { Height = 200, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Margin = new Thickness(0, 0, 0, 6) };
+            private int _shownCount;
             private readonly TextBlock _panelScope = new TextBlock { Foreground = Brush("#64748B"), Margin = new Thickness(0, 2, 0, 6) };
             private readonly WpfTextBox _allowance = Field("5");
             private readonly WpfTextBox _tolerance = Field("100");
@@ -819,7 +823,15 @@ namespace MyRevitCommands
                         ReadParameter(panel, "Comments")
                     })
                 }).ToList();
-                _selectedIds = new HashSet<long>(_items.Select(item => item.Id));
+                // Start with NO panel ticked so picking one panel gives exactly one panel.
+                _selectedIds = new HashSet<long>();
+                foreach (PanelItem item in _items)
+                {
+                    PanelItem current = item;
+                    current.Box = new WpfCheckBox { Content = current.Display, IsChecked = false, Margin = new Thickness(0, 3, 0, 3) };
+                    current.Box.Checked += (sender, args) => { if (!_refreshing) { _selectedIds.Add(current.Id); UpdateScopeText(); } };
+                    current.Box.Unchecked += (sender, args) => { if (!_refreshing) { _selectedIds.Remove(current.Id); UpdateScopeText(); } };
+                }
 
                 Title = ToolName;
                 Width = 820;
@@ -860,7 +872,6 @@ namespace MyRevitCommands
                 Content = root;
 
                 _search.TextChanged += (sender, args) => RefreshPanelList();
-                _panelList.SelectionChanged += PanelSelectionChanged;
                 RefreshPanelList();
                 Loaded += (sender, args) => _search.Focus();
             }
@@ -885,12 +896,13 @@ namespace MyRevitCommands
                 var panel = new StackPanel();
                 panel.Children.Add(new TextBlock { Text = "Search panels by name, mark, ID, category or comments", Foreground = Brush("#475569") });
                 panel.Children.Add(_search);
-                panel.Children.Add(_panelList);
+                _panelList.Content = _panelRows;
+                panel.Children.Add(new Border { BorderBrush = Brush("#CBD5E1"), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(4), Margin = new Thickness(0, 0, 0, 6), Child = _panelList });
 
                 var row = new StackPanel { Orientation = Orientation.Horizontal };
-                WpfButton selectShown = MakeButton("Select shown", false);
+                WpfButton selectShown = MakeButton("Tick all shown", false);
                 selectShown.Click += (sender, args) => SetShown(true);
-                WpfButton clearShown = MakeButton("Clear shown", false);
+                WpfButton clearShown = MakeButton("Untick all shown", false);
                 clearShown.Margin = new Thickness(6, 0, 0, 0);
                 clearShown.Click += (sender, args) => SetShown(false);
                 WpfButton clearSearch = MakeButton("Clear search", false);
@@ -945,14 +957,18 @@ namespace MyRevitCommands
                 try
                 {
                     string query = (_search.Text ?? string.Empty).Trim();
-                    _panelList.Items.Clear();
+                    _panelRows.Children.Clear();
+                    _shownCount = 0;
                     foreach (PanelItem item in _items)
                     {
                         if (query.Length > 0 && item.SearchText.IndexOf(query, StringComparison.CurrentCultureIgnoreCase) < 0)
                             continue;
-                        _panelList.Items.Add(item);
-                        if (_selectedIds.Contains(item.Id)) _panelList.SelectedItems.Add(item);
+                        item.Box.IsChecked = _selectedIds.Contains(item.Id);
+                        _panelRows.Children.Add(item.Box);
+                        _shownCount++;
                     }
+                    if (_shownCount == 0)
+                        _panelRows.Children.Add(new TextBlock { Text = "No panel matches \"" + query + "\".", Foreground = Brush("#64748B"), Margin = new Thickness(0, 3, 0, 3) });
                 }
                 finally
                 {
@@ -961,17 +977,9 @@ namespace MyRevitCommands
                 UpdateScopeText();
             }
 
-            private void PanelSelectionChanged(object sender, SelectionChangedEventArgs args)
-            {
-                if (_refreshing) return;
-                foreach (PanelItem removed in args.RemovedItems.OfType<PanelItem>()) _selectedIds.Remove(removed.Id);
-                foreach (PanelItem added in args.AddedItems.OfType<PanelItem>()) _selectedIds.Add(added.Id);
-                UpdateScopeText();
-            }
-
             private void SetShown(bool selected)
             {
-                foreach (PanelItem item in _panelList.Items.OfType<PanelItem>())
+                foreach (PanelItem item in _panelRows.Children.OfType<WpfCheckBox>().Select(box => _items.First(candidate => candidate.Box == box)))
                 {
                     if (selected) _selectedIds.Add(item.Id);
                     else _selectedIds.Remove(item.Id);
@@ -981,8 +989,8 @@ namespace MyRevitCommands
 
             private void UpdateScopeText()
             {
-                _panelScope.Text = _selectedIds.Count + " of " + _panels.Count + " panel(s) selected, "
-                    + _panelList.Items.Count + " shown. Click a panel to select or deselect it.";
+                _panelScope.Text = _selectedIds.Count + " of " + _panels.Count + " panel(s) ticked, "
+                    + _shownCount + " shown. Tick each panel you want to measure.";
             }
 
             private void RunClicked(object sender, RoutedEventArgs args)
@@ -991,7 +999,7 @@ namespace MyRevitCommands
                 {
                     if (!IncludePairs && !IncludeCircuits && !IncludeIsolators) throw new FormatException("Choose at least one route type.");
                     List<Element> selected = _items.Where(item => _selectedIds.Contains(item.Id)).Select(item => item.Element).ToList();
-                    if (selected.Count == 0) throw new FormatException("Select at least one panel.");
+                    if (selected.Count == 0) throw new FormatException("Tick at least one panel (or press \"Tick all shown\").");
                     if (IncludePairs && !IncludeCircuits && !IncludeIsolators && selected.Count < 2) throw new FormatException("Select at least two panels to measure panel-to-panel pairs.");
                     Allowance = Read(_allowance, "Cable allowance", 0, true);
                     ToleranceMm = Read(_tolerance, "Tray join tolerance", 0, false);
