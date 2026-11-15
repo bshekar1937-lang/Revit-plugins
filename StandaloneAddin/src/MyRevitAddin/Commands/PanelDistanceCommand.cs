@@ -35,6 +35,7 @@ namespace MyRevitCommands
 
         public Result Execute(ExternalCommandData commandData, ref string message, ElementSet elements)
         {
+            string stage = "starting";
             try
             {
                 UIDocument uiDocument = commandData.Application.ActiveUIDocument;
@@ -45,6 +46,7 @@ namespace MyRevitCommands
                 }
                 Document document = uiDocument.Document;
 
+                stage = "collecting electrical equipment and cable trays";
                 List<Element> panels = new FilteredElementCollector(document)
                     .OfCategory(BuiltInCategory.OST_ElectricalEquipment)
                     .WhereElementIsNotElementType()
@@ -68,11 +70,14 @@ namespace MyRevitCommands
                     return Result.Cancelled;
                 }
 
+                stage = "opening the setup window";
                 var setup = new SetupWindow(panels, trays.Count, commandData.Application.MainWindowHandle);
                 if (setup.ShowDialog() != true)
                     return Result.Cancelled;
 
+                stage = "building the cable tray network";
                 var network = new TrayNetwork(trays, setup.ToleranceMm, setup.BridgeGapMm, setup.TrayPreference);
+                stage = "measuring routes";
                 List<Route> routes = MeasureRoutes(document, network, setup);
                 if (routes.Count == 0)
                 {
@@ -85,6 +90,7 @@ namespace MyRevitCommands
                 bool drawn = false;
                 if (setup.DrawLines)
                 {
+                    stage = "drawing detail lines";
                     try
                     {
                         DrawRoutes(document, routes);
@@ -97,6 +103,7 @@ namespace MyRevitCommands
                     }
                 }
 
+                stage = "showing the results window";
                 var resultWindow = new ResultsWindow(document, uiDocument, routes, setup, network.Issues, network.PreviewTrays, drawn, drawNote, commandData.Application.MainWindowHandle);
                 resultWindow.ShowDialog();
                 return Result.Succeeded;
@@ -107,9 +114,35 @@ namespace MyRevitCommands
             }
             catch (Exception exception)
             {
-                message = exception.Message;
-                return Result.Failed;
+                ShowError(stage, exception);
+                return Result.Cancelled; // error already shown with full details
             }
+        }
+
+        /// <summary>
+        /// Shows WHERE the tool failed (stage + stack trace) and writes the same
+        /// text to %TEMP%\PanelDistance_error.log so it can be sent for support.
+        /// Copy the .pdb next to the .dll to get line numbers in the trace.
+        /// </summary>
+        private static void ShowError(string stage, Exception exception)
+        {
+            string details = "Stage: " + stage + Environment.NewLine
+                + "Revit add-in version: " + typeof(PanelDistanceCommand).Assembly.GetName().Version + Environment.NewLine
+                + Environment.NewLine + exception;
+            string logPath = Path.Combine(Path.GetTempPath(), "PanelDistance_error.log");
+            try { File.WriteAllText(logPath, DateTime.Now.ToString("u", CultureInfo.InvariantCulture) + Environment.NewLine + details); }
+            catch (Exception) { logPath = null; }
+
+            var dialog = new TaskDialog(ToolName)
+            {
+                MainIcon = TaskDialogIcon.TaskDialogIconError,
+                MainInstruction = "Panel Distance stopped while " + stage + ".",
+                MainContent = exception.Message
+                    + (logPath == null ? string.Empty : "\n\nFull details were saved to:\n" + logPath),
+                ExpandedContent = details,
+                AllowCancellation = true
+            };
+            dialog.Show();
         }
 
         // ------------------------------------------------------------------
@@ -131,28 +164,49 @@ namespace MyRevitCommands
 
             foreach (ElectricalSystem system in systems)
             {
-                Element baseEquipment = system.BaseEquipment;
-                if (baseEquipment == null || !panelIds.Contains(IdValue(baseEquipment.Id)))
+                // Some circuits (spares, spaces, unassigned or corrupt systems) throw or
+                // return nulls from the API. Skip and report them instead of stopping.
+                Element baseEquipment;
+                List<Element> members;
+                string circuitNumber;
+                try
+                {
+                    baseEquipment = system.BaseEquipment;
+                    if (baseEquipment == null || baseEquipment.Id == null || !panelIds.Contains(IdValue(baseEquipment.Id)))
+                        continue;
+                    ElementSet set = system.Elements;
+                    members = set == null ? new List<Element>() : set.Cast<Element>().Where(member => member != null).ToList();
+                    circuitNumber = system.CircuitNumber ?? string.Empty;
+                }
+                catch (Exception exception)
+                {
+                    network.Issues.Add("Circuit (system ID " + SafeId(system) + ") skipped: " + exception.Message);
                     continue;
-                ElementSet members = system.Elements;
-                if (members == null)
-                    continue;
+                }
+
                 foreach (Element member in members)
                 {
-                    if (member == null || member.Id == baseEquipment.Id)
-                        continue;
-                    circuitPairs.Add(PairKey(baseEquipment.Id, member.Id));
-                    bool isolator = IsolatorName(member);
-                    if ((!settings.IncludeCircuits && !isolator) || (isolator && !settings.IncludeIsolators))
-                        continue;
-                    Route route = network.Measure(baseEquipment, member, isolator ? "Isolator" : "Circuit");
-                    if (route == null)
-                        continue;
-                    route.Circuit = system.CircuitNumber ?? string.Empty;
-                    route.Current = ReadElectricalValue(system, settings.Current, "ApparentCurrent", "Current");
-                    route.Voltage = ReadElectricalValue(system, settings.Voltage, "NominalVoltage", "Voltage");
-                    route.Calculate(settings);
-                    routes.Add(route);
+                    try
+                    {
+                        if (member.Id == baseEquipment.Id)
+                            continue;
+                        circuitPairs.Add(PairKey(baseEquipment.Id, member.Id));
+                        bool isolator = IsolatorName(member);
+                        if ((!settings.IncludeCircuits && !isolator) || (isolator && !settings.IncludeIsolators))
+                            continue;
+                        Route route = network.Measure(baseEquipment, member, isolator ? "Isolator" : "Circuit");
+                        if (route == null)
+                            continue;
+                        route.Circuit = circuitNumber;
+                        route.Current = ReadElectricalValue(system, settings.Current, "ApparentCurrent", "Current");
+                        route.Voltage = ReadElectricalValue(system, settings.Voltage, "NominalVoltage", "Voltage");
+                        route.Calculate(settings);
+                        routes.Add(route);
+                    }
+                    catch (Exception exception)
+                    {
+                        network.Issues.Add("Circuit " + circuitNumber + " to " + SafeName(member) + " (ID " + SafeId(member) + ") skipped: " + exception.Message);
+                    }
                 }
             }
 
@@ -162,13 +216,20 @@ namespace MyRevitCommands
                 {
                     for (int j = i + 1; j < panels.Count; j++)
                     {
-                        if (circuitPairs.Contains(PairKey(panels[i].Id, panels[j].Id)))
-                            continue;
-                        Route route = network.Measure(panels[i], panels[j], "Panel pair");
-                        if (route == null || (settings.MaximumPairMetres > 0 && route.LengthMetres > settings.MaximumPairMetres))
-                            continue;
-                        route.Calculate(settings);
-                        routes.Add(route);
+                        try
+                        {
+                            if (circuitPairs.Contains(PairKey(panels[i].Id, panels[j].Id)))
+                                continue;
+                            Route route = network.Measure(panels[i], panels[j], "Panel pair");
+                            if (route == null || (settings.MaximumPairMetres > 0 && route.LengthMetres > settings.MaximumPairMetres))
+                                continue;
+                            route.Calculate(settings);
+                            routes.Add(route);
+                        }
+                        catch (Exception exception)
+                        {
+                            network.Issues.Add("Pair " + SafeName(panels[i]) + " / " + SafeName(panels[j]) + " skipped: " + exception.Message);
+                        }
                     }
                 }
             }
@@ -219,6 +280,24 @@ namespace MyRevitCommands
 #endif
         }
 
+        private static string SafeId(Element element)
+        {
+            try { return element == null || element.Id == null ? "?" : IdValue(element.Id).ToString(CultureInfo.InvariantCulture); }
+            catch (Exception) { return "?"; }
+        }
+
+        private static string CategoryName(Element element)
+        {
+            try { return element == null || element.Category == null ? string.Empty : element.Category.Name ?? string.Empty; }
+            catch (Exception) { return string.Empty; }
+        }
+
+        private static string SafeName(Element element)
+        {
+            try { return GetElementName(element); }
+            catch (Exception) { return "Element " + SafeId(element); }
+        }
+
         private static string PairKey(ElementId first, ElementId second)
         {
             long a = IdValue(first);
@@ -234,10 +313,18 @@ namespace MyRevitCommands
 
         private static string ReadParameter(Element element, string name)
         {
-            Parameter parameter = element.LookupParameter(name);
-            if (parameter == null || !parameter.HasValue)
+            if (element == null) return string.Empty;
+            try
+            {
+                Parameter parameter = element.LookupParameter(name);
+                if (parameter == null || !parameter.HasValue)
+                    return string.Empty;
+                return parameter.AsString() ?? parameter.AsValueString() ?? string.Empty;
+            }
+            catch (Exception)
+            {
                 return string.Empty;
-            return parameter.AsString() ?? parameter.AsValueString() ?? string.Empty;
+            }
         }
 
         private static string GetElementName(Element element)
@@ -249,27 +336,38 @@ namespace MyRevitCommands
                 string value = ReadParameter(element, parameterName);
                 if (!string.IsNullOrWhiteSpace(value)) return value;
             }
-            return string.IsNullOrWhiteSpace(element.Name) ? "Element " + IdValue(element.Id) : element.Name;
+            string name = null;
+            try { name = element.Name; } catch (Exception) { }
+            return string.IsNullOrWhiteSpace(name) ? "Element " + SafeId(element) : name;
         }
 
         private static List<XYZ> GetElementPoints(Element element)
         {
             var points = new List<XYZ>();
+            if (element == null) return points;
             FamilyInstance instance = element as FamilyInstance;
-            if (instance != null && instance.MEPModel != null && instance.MEPModel.ConnectorManager != null)
+            try
             {
-                try
+                MEPModel model = instance == null ? null : instance.MEPModel;
+                ConnectorManager manager = model == null ? null : model.ConnectorManager;
+                if (manager != null && manager.Connectors != null)
                 {
-                    foreach (Connector connector in instance.MEPModel.ConnectorManager.Connectors)
-                        points.Add(connector.Origin);
+                    foreach (Connector connector in manager.Connectors)
+                    {
+                        try
+                        {
+                            if (connector != null && connector.Origin != null) points.Add(connector.Origin);
+                        }
+                        catch (Exception) { } // logical connectors have no origin
+                    }
                 }
-                catch (Autodesk.Revit.Exceptions.InvalidOperationException) { }
             }
+            catch (Exception) { }
             if (points.Count > 0) return points;
             LocationPoint locationPoint = element.Location as LocationPoint;
             if (locationPoint != null) return new List<XYZ> { locationPoint.Point };
             LocationCurve locationCurve = element.Location as LocationCurve;
-            if (locationCurve != null) return new List<XYZ> { locationCurve.Curve.GetEndPoint(0), locationCurve.Curve.GetEndPoint(1) };
+            if (locationCurve != null && locationCurve.Curve != null) return new List<XYZ> { locationCurve.Curve.GetEndPoint(0), locationCurve.Curve.GetEndPoint(1) };
             BoundingBoxXYZ box = element.get_BoundingBox(null);
             return box == null ? points : new List<XYZ> { (box.Min + box.Max) * 0.5 };
         }
@@ -418,9 +516,9 @@ namespace MyRevitCommands
                 int skipped = 0;
                 foreach (Element tray in trays)
                 {
-                    LocationCurve location = tray.Location as LocationCurve;
-                    if (location == null || location.Curve == null) { skipped++; continue; }
-                    Curve curve = location.Curve;
+                    LocationCurve location = tray == null ? null : tray.Location as LocationCurve;
+                    Curve curve = location == null ? null : location.Curve;
+                    if (curve == null || !curve.IsBound) { skipped++; continue; }
                     XYZ start = curve.GetEndPoint(0);
                     XYZ end = curve.GetEndPoint(1);
                     int a = NodeAt(start);
@@ -500,6 +598,7 @@ namespace MyRevitCommands
 
             public Route Measure(Element source, Element destination, string kind)
             {
+                if (source == null || destination == null || _segments.Count == 0) return null;
                 List<XYZ> sourcePoints = GetElementPoints(source);
                 List<XYZ> destinationPoints = GetElementPoints(destination);
                 if (sourcePoints.Count == 0 || destinationPoints.Count == 0) return null;
@@ -713,9 +812,9 @@ namespace MyRevitCommands
                     SearchText = string.Join(" ", new[]
                     {
                         GetElementName(panel),
-                        panel.Name,
+                        SafeName(panel),
                         IdValue(panel.Id).ToString(CultureInfo.InvariantCulture),
-                        panel.Category == null ? string.Empty : panel.Category.Name,
+                        CategoryName(panel),
                         ReadParameter(panel, "Mark"),
                         ReadParameter(panel, "Comments")
                     })
