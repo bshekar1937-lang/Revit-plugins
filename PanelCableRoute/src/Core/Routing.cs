@@ -54,7 +54,7 @@ namespace PanelCableRoute.Core
                 {
                     continue;
                 }
-                double total = distance + destination.Cost;
+                double total = distance + destination.WeightedCost;
                 if (bestDestination == null || total < bestTotal)
                 {
                     bestDestination = destination;
@@ -73,16 +73,34 @@ namespace PanelCableRoute.Core
                 if (source != null)
                 {
                     RouteMeasurement measurement = new RouteMeasurement();
-                    measurement.Total = bestTotal;
                     measurement.Source = source;
                     measurement.Destination = bestDestination;
                     measurement.PathEdges =
                         network.PathTo(reach, bestDestination.Node);
-                    double networkLength =
-                        reach.Distances[bestDestination.Node] - source.Cost;
-                    measurement.NetworkLength =
-                        networkLength > 0.0 ? networkLength : 0.0;
-                    measurement.Bridge = 0.0;
+                    // The distance Dijkstra worked with is weighted, because
+                    // a hop through the air costs more than its length. The
+                    // reported lengths are the real ones, added up along the
+                    // path that preference chose.
+                    double trayLength = 0.0;
+                    double bridgeLength = 0.0;
+                    for (int index = 0;
+                         index < measurement.PathEdges.Count;
+                         index++)
+                    {
+                        NetworkEdge edge = measurement.PathEdges[index];
+                        if (edge.Kind == EdgeKind.Bridge)
+                        {
+                            bridgeLength += edge.RealLength;
+                        }
+                        else
+                        {
+                            trayLength += edge.RealLength;
+                        }
+                    }
+                    measurement.NetworkLength = trayLength;
+                    measurement.Bridge = bridgeLength;
+                    measurement.Total = source.Cost + trayLength
+                        + bridgeLength + bestDestination.Cost;
                     measurement.Points = Polyline(
                         network, source, bestDestination,
                         measurement.PathEdges, false);
@@ -90,7 +108,9 @@ namespace PanelCableRoute.Core
                 }
             }
 
-            // The trays do not join up: keep both tray legs and bridge the gap.
+            // No path at all, even across the bridged gaps: keep both tray
+            // legs and cross the remaining distance in one hop. This is the
+            // last resort and shows up in the preview as a bridged route.
             Attachment fallbackSource = null;
             Attachment fallbackDestination = null;
             double fallbackTotal = 0.0;

@@ -56,7 +56,9 @@ namespace PanelCableRoute.Core
     public enum EdgeKind
     {
         Tray,
-        Fitting
+        Fitting,
+        /// <summary>A hop through the air between two unjoined tray ends.</summary>
+        Bridge
     }
 
     /// <summary>One hop of the network, and the points it is drawn with.</summary>
@@ -66,7 +68,10 @@ namespace PanelCableRoute.Core
         public long OwnerId;        // the tray or the fitting
         public int FromNode;        // the node Points starts at
         public int ToNode;
+        /// <summary>What the router pays. A bridge costs more than its length.</summary>
         public double Weight;
+        /// <summary>The real distance, which is what gets reported.</summary>
+        public double RealLength;
         public Pt[] Points;         // centre line, FromNode to ToNode
     }
 
@@ -85,10 +90,27 @@ namespace PanelCableRoute.Core
         public bool Vertical;
         /// <summary>The tray centre line from the drop point to the node.</summary>
         public Pt[] PartialPoints;
+        /// <summary>
+        /// What the drop off the tray is multiplied by when the router
+        /// compares routes. Travel along a tray is never weighted.
+        /// </summary>
+        public double GapWeight = 1.0;
 
+        /// <summary>The real distance, which is what gets reported.</summary>
         public double Cost
         {
             get { return Gap + PartialLength; }
+        }
+
+        /// <summary>
+        /// What the router pays. Dropping off a tray is off-tray travel, so
+        /// it is weighted exactly as a hop between tray runs is: without
+        /// that, a route will happily fly several metres through the air to
+        /// a tray that saves it a short walk.
+        /// </summary>
+        public double WeightedCost
+        {
+            get { return Gap * GapWeight + PartialLength; }
         }
     }
 
@@ -121,6 +143,8 @@ namespace PanelCableRoute.Core
 
         private readonly double _tolerance;
         private readonly double _cellSize;
+        /// <summary>Set by BridgeGaps; 1.0 means off-tray travel is not weighted.</summary>
+        private double _preference = 1.0;
         private readonly List<Pt> _nodePoints = new List<Pt>();
         private readonly Dictionary<Cell, List<int>> _nodeCells =
             new Dictionary<Cell, List<int>>();
@@ -134,6 +158,19 @@ namespace PanelCableRoute.Core
             new Dictionary<Cell, List<long>>();
 
         public int FittingsBridged { get; private set; }
+
+        /// <summary>
+        /// How many separate groups of joined-up trays the model has. More
+        /// than one means the trays do not form a single network, which is
+        /// the usual reason a route ends up crossing open space.
+        /// </summary>
+        public int ComponentCount { get; private set; }
+
+        /// <summary>Hops added across gaps between those groups.</summary>
+        public int BridgeEdgeCount { get; private set; }
+
+        /// <summary>The real length of every bridge hop added, in feet.</summary>
+        public double BridgeLengthAdded { get; private set; }
 
         public TrayNetwork(
             IEnumerable<TraySegment> trays,
@@ -281,6 +318,12 @@ namespace PanelCableRoute.Core
         private void AddEdge(int nodeA, int nodeB, double weight,
             EdgeKind kind, long ownerId, Pt[] points)
         {
+            AddEdge(nodeA, nodeB, weight, weight, kind, ownerId, points);
+        }
+
+        private void AddEdge(int nodeA, int nodeB, double weight,
+            double realLength, EdgeKind kind, long ownerId, Pt[] points)
+        {
             if (nodeA == nodeB)
             {
                 return;
@@ -291,6 +334,7 @@ namespace PanelCableRoute.Core
             forward.FromNode = nodeA;
             forward.ToNode = nodeB;
             forward.Weight = weight;
+            forward.RealLength = realLength;
             forward.Points = points;
             NetworkEdge backward = new NetworkEdge();
             backward.Kind = kind;
@@ -298,6 +342,7 @@ namespace PanelCableRoute.Core
             backward.FromNode = nodeB;
             backward.ToNode = nodeA;
             backward.Weight = weight;
+            backward.RealLength = realLength;
             backward.Points = Reversed(points);
             Attach(nodeA, forward);
             Attach(nodeB, backward);
@@ -461,6 +506,172 @@ namespace PanelCableRoute.Core
             return new List<long>(_trays.Keys);
         }
 
+        // ----- joining up the gaps ---------------------------------------------
+        /// <summary>Which group of joined-up trays each node belongs to.</summary>
+        private int[] Components(out int count)
+        {
+            int[] component = new int[_nodePoints.Count];
+            for (int index = 0; index < component.Length; index++)
+            {
+                component[index] = -1;
+            }
+            count = 0;
+            Queue<int> pending = new Queue<int>();
+            for (int start = 0; start < component.Length; start++)
+            {
+                if (component[start] >= 0)
+                {
+                    continue;
+                }
+                component[start] = count;
+                pending.Enqueue(start);
+                while (pending.Count > 0)
+                {
+                    int node = pending.Dequeue();
+                    List<NetworkEdge> edges;
+                    if (!_graph.TryGetValue(node, out edges))
+                    {
+                        continue;
+                    }
+                    for (int index = 0; index < edges.Count; index++)
+                    {
+                        int next = edges[index].ToNode;
+                        if (component[next] < 0)
+                        {
+                            component[next] = count;
+                            pending.Enqueue(next);
+                        }
+                    }
+                }
+                count++;
+            }
+            return component;
+        }
+
+        /// <summary>
+        /// Join groups of trays that stop short of each other, so a route can
+        /// run along the trays, hop a gap and carry on along the next run,
+        /// instead of abandoning the trays and crossing open space.
+        ///
+        /// A hop costs 'preference' times its length, so the router takes a
+        /// much longer way round on trays rather than a short hop through the
+        /// air, and crosses a gap only where there is really no tray path.
+        /// The hop is still reported at its true length.
+        /// </summary>
+        public void BridgeGaps(double maxGapMm, double preference)
+        {
+            _preference = preference > 1.0 ? preference : 1.0;
+            int before;
+            int[] component = Components(out before);
+            ComponentCount = before;
+            if (before <= 1 || maxGapMm <= 0.0 || _nodePoints.Count == 0)
+            {
+                return;
+            }
+            double maxGap = Units.MmToFeet(maxGapMm);
+            double weighting = preference > 1.0 ? preference : 1.0;
+
+            // A coarse index, so each node only looks at the nodes near it.
+            double cell = Math.Max(maxGap, Units.MmToFeet(500.0));
+            Dictionary<Cell, List<int>> buckets =
+                new Dictionary<Cell, List<int>>();
+            for (int node = 0; node < _nodePoints.Count; node++)
+            {
+                Cell key = CellOf(_nodePoints[node], cell);
+                List<int> bucket;
+                if (!buckets.TryGetValue(key, out bucket))
+                {
+                    bucket = new List<int>();
+                    buckets[key] = bucket;
+                }
+                bucket.Add(node);
+            }
+
+            HashSet<string> added = new HashSet<string>();
+            for (int node = 0; node < _nodePoints.Count; node++)
+            {
+                Pt point = _nodePoints[node];
+                Cell home = CellOf(point, cell);
+                // The two nearest ends in other groups: one is the usual
+                // case, and two lets a tray run broken in the middle be
+                // rejoined from both sides.
+                int firstNode = -1;
+                int secondNode = -1;
+                double firstGap = double.MaxValue;
+                double secondGap = double.MaxValue;
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    for (int dy = -1; dy <= 1; dy++)
+                    {
+                        for (int dz = -1; dz <= 1; dz++)
+                        {
+                            List<int> bucket;
+                            if (!buckets.TryGetValue(new Cell(
+                                    home.X + dx, home.Y + dy, home.Z + dz),
+                                    out bucket))
+                            {
+                                continue;
+                            }
+                            for (int item = 0; item < bucket.Count; item++)
+                            {
+                                int other = bucket[item];
+                                if (other == node
+                                        || component[other] == component[node])
+                                {
+                                    continue;
+                                }
+                                double gap = point.DistanceTo(
+                                    _nodePoints[other]);
+                                if (gap > maxGap)
+                                {
+                                    continue;
+                                }
+                                if (gap < firstGap)
+                                {
+                                    secondGap = firstGap;
+                                    secondNode = firstNode;
+                                    firstGap = gap;
+                                    firstNode = other;
+                                }
+                                else if (gap < secondGap)
+                                {
+                                    secondGap = gap;
+                                    secondNode = other;
+                                }
+                            }
+                        }
+                    }
+                }
+                int[] chosen = new int[] { firstNode, secondNode };
+                for (int index = 0; index < chosen.Length; index++)
+                {
+                    int other = chosen[index];
+                    if (other < 0)
+                    {
+                        continue;
+                    }
+                    string key = Math.Min(node, other).ToString() + ":"
+                        + Math.Max(node, other).ToString();
+                    if (!added.Add(key))
+                    {
+                        continue;
+                    }
+                    Pt from = _nodePoints[node];
+                    Pt to = _nodePoints[other];
+                    // The cable turns the corner rather than cutting across.
+                    double length = Geometry.OrthogonalDistance(from, to);
+                    Pt[] points = Geometry.OrthogonalPoints(from, to).ToArray();
+                    AddEdge(node, other, length * weighting, length,
+                        EdgeKind.Bridge, -1, points);
+                    BridgeEdgeCount++;
+                    BridgeLengthAdded += length;
+                }
+            }
+            int after;
+            Components(out after);
+            ComponentCount = after;
+        }
+
         // ----- attaching ------------------------------------------------------
         /// <summary>Where this equipment joins the network, cheapest first.</summary>
         public List<Attachment> Attach(IList<Pt> equipmentPoints)
@@ -507,6 +718,7 @@ namespace PanelCableRoute.Core
                         attachment.TrayId = tray.Id;
                         attachment.Vertical = vertical;
                         attachment.PartialPoints = partialPoints;
+                        attachment.GapWeight = _preference;
                         candidates.Add(attachment);
                     }
                 }
@@ -632,7 +844,7 @@ namespace PanelCableRoute.Core
             for (int index = 0; index < attachments.Count; index++)
             {
                 Attachment attachment = attachments[index];
-                double cost = attachment.Cost;
+                double cost = attachment.WeightedCost;
                 double existing;
                 if (reach.Distances.TryGetValue(attachment.Node, out existing)
                         && existing <= cost)

@@ -106,6 +106,10 @@ ROUTE_STYLE_NAME = "Auto Cable Route - Red"
 DEFAULT_CONNECTION_TOLERANCE_MM = 100.0
 # Attachment candidates kept per equipment item (the nearest tray points).
 MAX_ATTACH_CANDIDATES = 8
+# How far a route may hop between tray runs that stop short of each other,
+# and how much more a metre off the trays costs than a metre along them.
+DEFAULT_BRIDGE_GAP_MM = 3000.0
+DEFAULT_TRAY_PREFERENCE = 8.0
 # A cable leaves the tray at the point nearest the equipment. Candidates whose
 # orthogonal gap is more than this beyond the nearest one are dropped: without
 # that, projecting onto every tray in the building invents an attachment at
@@ -128,6 +132,8 @@ DEFAULT_SETTINGS = {
     "limit_percent": "5",          # voltage drop limit %
     "draw_lines": "1",             # draw the red detail lines
     "max_pair_metres": "0",        # 0 = no limit on a pair's route length
+    "bridge_gap": "3000",          # join tray runs up to this far apart, mm
+    "preference": "8",             # off-tray travel costs this x its length
 }
 
 
@@ -610,6 +616,21 @@ def isolators_behind(element_ids, isolators_by_id):
 # =============================================================================
 # The cable tray network
 # =============================================================================
+# Nodes are tray ends; two ends within the connection tolerance share one, and
+# that is how a run of trays becomes a connected path. Fittings join the ends
+# plugged into them.
+#
+# Real models are rarely one connected network: runs stop short of each other,
+# fittings are missing, risers do not quite meet. bridge_gaps() finds the
+# separate groups and adds a hop between the ones that nearly touch, so a
+# route can run along the trays, cross a gap and carry on - instead of giving
+# up on the trays and striking out across the building.
+#
+# Every bit of travel that is not along a tray - the drop from a panel, and
+# each hop - is multiplied by PREFERENCE when routes are compared, so the
+# router will follow a long way round on trays rather than a short line
+# through the air. The lengths reported are always the real ones.
+# =============================================================================
 def orthogonal_distance(start, finish):
     """Across, along and up - how a cable actually gets from A to B."""
     return (abs(start.X - finish.X) + abs(start.Y - finish.Y) +
@@ -636,6 +657,10 @@ def is_vertical_curve(curve, tolerance):
     return abs(end.Z - start.Z) > tolerance and plan_length <= tolerance
 
 
+def reversed_points(points):
+    return list(reversed(points))
+
+
 class TrayNetwork(object):
     """Every modelled cable tray centre line, joined into one graph."""
 
@@ -646,7 +671,10 @@ class TrayNetwork(object):
         self.node_buckets = {}
         self.trays = {}             # tray id -> (element, curve, length, a, b)
         self.fitting_count = 0
-        self.loose_joins = 0
+        self.preference = 1.0       # 1.0 = off-tray travel is not weighted
+        self.component_count = 0
+        self.bridge_edges = 0
+        self.bridge_length = 0.0
         # Trays bucketed by a coarse grid, so attaching one panel projects
         # onto the trays around it instead of every tray in the building.
         self.cell_size = feet(5000.0)
@@ -655,14 +683,14 @@ class TrayNetwork(object):
         self._index_trays()
 
     # ----- building ----------------------------------------------------------
-    def _node_cell(self, point):
-        return (int(math.floor(point.X / self.tolerance)),
-                int(math.floor(point.Y / self.tolerance)),
-                int(math.floor(point.Z / self.tolerance)))
+    def _cell_of(self, point, size):
+        return (int(math.floor(point.X / size)),
+                int(math.floor(point.Y / size)),
+                int(math.floor(point.Z / size)))
 
-    def node_at(self, point):
-        """The node at this point, within the connection tolerance."""
-        cell = self._node_cell(point)
+    def node_at(self, point, create=True):
+        """The node at this point, within the tolerance, or a new one."""
+        cell = self._cell_of(point, self.tolerance)
         nearest = None
         nearest_distance = self.tolerance
         for delta_x in (-1, 0, 1):
@@ -675,18 +703,31 @@ class TrayNetwork(object):
                         if distance <= nearest_distance:
                             nearest = node
                             nearest_distance = distance
-        if nearest is not None:
+        if nearest is not None or not create:
             return nearest
         node = len(self.node_points)
         self.node_points[node] = point
         self.node_buckets.setdefault(cell, []).append(node)
         return node
 
-    def add_edge(self, node_a, node_b, weight, edge_data):
+    def add_edge(self, node_a, node_b, weight, kind, owner_id, points,
+                 real_length=None):
+        """One hop, both ways round. 'weight' is what the router pays and
+        'real_length' is what gets reported; they differ for a hop."""
         if node_a == node_b:
             return
-        self.graph.setdefault(node_a, []).append((node_b, weight, edge_data))
-        self.graph.setdefault(node_b, []).append((node_a, weight, edge_data))
+        if real_length is None:
+            real_length = weight
+        self.graph.setdefault(node_a, []).append({
+            "from": node_a, "to": node_b, "weight": weight,
+            "real": real_length, "kind": kind, "id": owner_id,
+            "points": points,
+        })
+        self.graph.setdefault(node_b, []).append({
+            "from": node_b, "to": node_a, "weight": weight,
+            "real": real_length, "kind": kind, "id": owner_id,
+            "points": reversed_points(points),
+        })
 
     def _build(self):
         trays = list(FilteredElementCollector(doc)
@@ -704,9 +745,12 @@ class TrayNetwork(object):
             node_b = self.node_at(point_b)
             tray_id = element_id_value(tray.Id)
             self.trays[tray_id] = (tray, curve, curve.Length, node_a, node_b)
-            self.add_edge(node_a, node_b, curve.Length, ("tray", tray_id))
-            # Ends that merely meet within the tolerance share a node, which
-            # is counted here only to report how the network was stitched.
+            try:
+                points = list(curve.Tessellate())
+            except Exception:
+                points = [point_a, point_b]
+            self.add_edge(node_a, node_b, curve.Length, "tray", tray_id,
+                          points)
             try:
                 for connector in tray.ConnectorManager.Connectors:
                     origin = connector.Origin
@@ -756,10 +800,8 @@ class TrayNetwork(object):
                         edge_points[step].DistanceTo(edge_points[step + 1])
                         for step in range(len(edge_points) - 1)
                     )
-                    self.add_edge(
-                        node_a, node_b, length,
-                        ("fitting", fitting_id, node_a, node_b, edge_points)
-                    )
+                    self.add_edge(node_a, node_b, length, "fitting",
+                                  fitting_id, edge_points)
 
     @property
     def ready(self):
@@ -767,7 +809,6 @@ class TrayNetwork(object):
 
     # ----- finding the trays near a point ------------------------------------
     def _index_trays(self):
-        """Bucket every tray into the grid cells its ends span."""
         for tray_id, data in self.trays.items():
             try:
                 start = data[1].GetEndPoint(0)
@@ -778,16 +819,16 @@ class TrayNetwork(object):
                    min(start.Z, end.Z))
             high = (max(start.X, end.X), max(start.Y, end.Y),
                     max(start.Z, end.Z))
-            for cell in self._cells_between(low, high):
+            for cell in self._cells_between(low, high, self.cell_size):
                 self.tray_cells.setdefault(cell, []).append(tray_id)
 
-    def _cells_between(self, low, high):
-        cells = []
+    def _cells_between(self, low, high, size):
         steps = []
         for axis in range(3):
-            first = int(math.floor(low[axis] / self.cell_size))
-            last = int(math.floor(high[axis] / self.cell_size))
+            first = int(math.floor(low[axis] / size))
+            last = int(math.floor(high[axis] / size))
             steps.append(range(first, last + 1))
+        cells = []
         for cell_x in steps[0]:
             for cell_y in steps[1]:
                 for cell_z in steps[2]:
@@ -795,19 +836,17 @@ class TrayNetwork(object):
         return cells
 
     def nearby_trays(self, points, radius):
-        """Ids of the trays within 'radius' feet of any of these points."""
         found = set()
         for point in points:
             low = (point.X - radius, point.Y - radius, point.Z - radius)
             high = (point.X + radius, point.Y + radius, point.Z + radius)
-            for cell in self._cells_between(low, high):
+            for cell in self._cells_between(low, high, self.cell_size):
                 found.update(self.tray_cells.get(cell, []))
         return found
 
     def search_trays(self, points):
-        """Trays worth projecting onto: the ones nearby, widening the search
-        until something is found (a plant room panel can be a long way from
-        the nearest tray)."""
+        """Trays worth projecting onto, widening the search until some turn
+        up (a plant room panel can be a long way from the nearest tray)."""
         if not self.trays:
             return []
         for radius_mm in (5000.0, 15000.0, 40000.0, 100000.0):
@@ -816,7 +855,79 @@ class TrayNetwork(object):
                 return list(found)
         return list(self.trays)
 
-    # ----- attaching equipment ----------------------------------------------
+    # ----- joining up the gaps ------------------------------------------------
+    def components(self):
+        """Which group of joined-up trays each node belongs to."""
+        component = {}
+        count = 0
+        for start in self.node_points:
+            if start in component:
+                continue
+            component[start] = count
+            pending = [start]
+            while pending:
+                node = pending.pop()
+                for edge in self.graph.get(node, []):
+                    if edge["to"] not in component:
+                        component[edge["to"]] = count
+                        pending.append(edge["to"])
+            count += 1
+        return component, count
+
+    def bridge_gaps(self, max_gap_mm, preference):
+        """Join tray runs that stop short of each other.
+
+        Each hop costs 'preference' times its length, so the router takes a
+        much longer way round on trays rather than a short hop through the
+        air, and crosses a gap only where there is no tray path at all."""
+        self.preference = preference if preference > 1.0 else 1.0
+        component, count = self.components()
+        self.component_count = count
+        if count <= 1 or max_gap_mm <= 0.0 or not self.node_points:
+            return
+        max_gap = feet(max_gap_mm)
+        cell_size = max(max_gap, feet(500.0))
+        buckets = {}
+        for node, point in self.node_points.items():
+            buckets.setdefault(self._cell_of(point, cell_size), []).append(node)
+
+        added = set()
+        for node, point in self.node_points.items():
+            home = self._cell_of(point, cell_size)
+            # The two nearest ends in other groups: one is the usual case,
+            # two lets a run broken in the middle be rejoined from both sides.
+            best = []
+            for delta_x in (-1, 0, 1):
+                for delta_y in (-1, 0, 1):
+                    for delta_z in (-1, 0, 1):
+                        bucket = (home[0] + delta_x, home[1] + delta_y,
+                                  home[2] + delta_z)
+                        for other in buckets.get(bucket, []):
+                            if (other == node
+                                    or component[other] == component[node]):
+                                continue
+                            gap = point.DistanceTo(self.node_points[other])
+                            if gap <= max_gap:
+                                best.append((gap, other))
+            best.sort(key=lambda item: item[0])
+            for gap, other in best[:2]:
+                key = (min(node, other), max(node, other))
+                if key in added:
+                    continue
+                added.add(key)
+                start = self.node_points[node]
+                finish = self.node_points[other]
+                # The cable turns the corner rather than cutting across.
+                length = orthogonal_distance(start, finish)
+                self.add_edge(
+                    node, other, length * self.preference, "bridge", -1,
+                    orthogonal_points(start, finish), length
+                )
+                self.bridge_edges += 1
+                self.bridge_length += length
+        _, self.component_count = self.components()
+
+    # ----- attaching equipment ------------------------------------------------
     def attach(self, equipment_points, maximum=MAX_ATTACH_CANDIDATES):
         """Where this equipment joins the network, cheapest first.
 
@@ -861,6 +972,7 @@ class TrayNetwork(object):
                             partial_points.reverse()
                     candidates.append({
                         "cost": gap + partial_length,
+                        "weighted": gap * self.preference + partial_length,
                         "node": data[3] if endpoint_index == 0 else data[4],
                         "gap": gap,
                         "partial_length": partial_length,
@@ -939,6 +1051,7 @@ class TrayNetwork(object):
                     gap = orthogonal_distance(equipment_point, tray_point)
                     candidates.append({
                         "cost": gap,
+                        "weighted": gap * self.preference,
                         "node": node,
                         "gap": gap,
                         "partial_length": 0.0,
@@ -950,11 +1063,11 @@ class TrayNetwork(object):
                     })
         return candidates
 
-    # ----- distances ---------------------------------------------------------
+    # ----- distances -----------------------------------------------------------
     def distances_from(self, candidates):
         """One Dijkstra pass for all of an item's attachment points.
 
-        Each candidate seeds the queue with its own attachment cost, so the
+        Each candidate seeds the queue with its own weighted cost, so the
         result is the cheapest way out of that panel to every node in the
         network - and every other panel is then a dictionary lookup."""
         distances = {}
@@ -963,7 +1076,7 @@ class TrayNetwork(object):
         queue = []
         for candidate in candidates:
             node = candidate["node"]
-            cost = candidate["cost"]
+            cost = candidate["weighted"]
             if cost < distances.get(node, float("inf")):
                 distances[node] = cost
                 seeds[node] = node
@@ -972,64 +1085,46 @@ class TrayNetwork(object):
             current, node = heapq.heappop(queue)
             if current > distances.get(node, float("inf")) + EPSILON:
                 continue
-            for neighbour, weight, edge_data in self.graph.get(node, []):
-                candidate_cost = current + weight
-                if candidate_cost < distances.get(neighbour, float("inf")):
-                    distances[neighbour] = candidate_cost
-                    previous[neighbour] = (node, edge_data)
-                    seeds[neighbour] = seeds[node]
-                    heapq.heappush(queue, (candidate_cost, neighbour))
+            for edge in self.graph.get(node, []):
+                candidate_cost = current + edge["weight"]
+                if candidate_cost < distances.get(edge["to"], float("inf")):
+                    distances[edge["to"]] = candidate_cost
+                    previous[edge["to"]] = edge
+                    seeds[edge["to"]] = seeds[node]
+                    heapq.heappush(queue, (candidate_cost, edge["to"]))
         return {"distances": distances, "previous": previous, "seeds": seeds}
 
     def path_to(self, reach, node):
-        """(nodes, edges) from the seed attachment node to this node."""
+        """The edges from the seed attachment node to this node."""
         previous = reach["previous"]
-        nodes = [node]
         edges = []
         cursor = node
         guard = 0
         while cursor in previous:
-            prior, edge_data = previous[cursor]
-            edges.append(edge_data)
-            nodes.append(prior)
-            cursor = prior
+            edge = previous[cursor]
+            edges.append(edge)
+            cursor = edge["from"]       # the edge points at 'cursor'
             guard += 1
             if guard > 1000000:
-                break
-        nodes.reverse()
+                break                   # a cycle is impossible, but never hang
         edges.reverse()
-        return nodes, edges
+        return edges
 
-    def edge_points(self, path_nodes, path_edges):
-        """The tray centre lines the route follows, in order."""
+    def edge_points(self, edges):
+        """The tray centre lines a path follows, in order."""
         points = []
-        for index, edge_data in enumerate(path_edges):
-            if edge_data[0] == "tray":
-                tray_id = edge_data[1]
-                data = self.trays.get(tray_id)
-                if data is None:
-                    continue
-                try:
-                    edge = list(data[1].Tessellate())
-                except Exception:
-                    continue
-                if path_nodes[index] != data[3]:
-                    edge.reverse()
-            else:
-                edge = list(edge_data[4])
-                if path_nodes[index] != edge_data[2]:
-                    edge.reverse()
-            points.extend(edge)
+        for edge in edges:
+            points.extend(edge["points"])
         return points
 
 
 def route_polyline(network, source_candidate, destination_candidate,
-                   path_nodes, path_edges, bridge):
+                   edges, bridge):
     """Every point of the drawn route, source equipment to destination."""
     points = orthogonal_points(source_candidate["equipment_point"],
                                source_candidate["tray_point"])
     points.extend(source_candidate["partial_points"])
-    points.extend(network.edge_points(path_nodes, path_edges))
+    points.extend(network.edge_points(edges))
     if bridge:
         points.extend(orthogonal_points(
             network.node_points[source_candidate["node"]],
@@ -1047,8 +1142,9 @@ def measure_route(network, source_reach, source_candidates,
                   destination_candidates):
     """Cheapest route from one attached item to another.
 
-    Returns the lengths, the points to draw and whether the trays had to be
-    bridged because the modelled network is in pieces."""
+    The distances Dijkstra worked with are weighted, because off-tray travel
+    costs more than its length. The lengths reported here are the real ones,
+    added up along the path that the preference chose."""
     by_node = {}
     for candidate in source_candidates:
         by_node[candidate["node"]] = candidate
@@ -1059,31 +1155,38 @@ def measure_route(network, source_reach, source_candidates,
         node = destination["node"]
         if node not in distances:
             continue
-        total = distances[node] + destination["cost"]
+        total = distances[node] + destination["weighted"]
         if best is None or total < best[0]:
             best = (total, destination)
     if best is not None:
-        total, destination = best
-        node = destination["node"]
-        source_candidate = by_node.get(seeds.get(node))
+        destination = best[1]
+        source_candidate = by_node.get(seeds.get(destination["node"]))
         if source_candidate is not None:
-            path_nodes, path_edges = network.path_to(source_reach, node)
-            network_length = (distances[node] - source_candidate["cost"])
+            edges = network.path_to(source_reach, destination["node"])
+            tray_length = 0.0
+            bridge_length = 0.0
+            for edge in edges:
+                if edge["kind"] == "bridge":
+                    bridge_length += edge["real"]
+                else:
+                    tray_length += edge["real"]
             return {
-                "total": total,
-                "network_length": max(network_length, 0.0),
+                "total": (source_candidate["cost"] + tray_length
+                          + bridge_length + destination["cost"]),
+                "network_length": tray_length,
                 "source": source_candidate,
                 "destination": destination,
-                "path_nodes": path_nodes,
-                "path_edges": path_edges,
-                "bridge": 0.0,
+                "path_edges": edges,
+                "bridge": bridge_length,
                 "points": route_polyline(
-                    network, source_candidate, destination,
-                    path_nodes, path_edges, False
+                    network, source_candidate, destination, edges, False
                 ),
             }
-    # The trays do not join up: keep both tray legs and bridge the gap.
+    # No path at all, even across the bridged gaps: keep both tray legs and
+    # cross the rest in one hop. This is the last resort, and the preview
+    # flags it.
     fallback = None
+    tie = feet(TIE_TOLERANCE_MM)
     for source_candidate in source_candidates:
         for destination in destination_candidates:
             gap = orthogonal_distance(
@@ -1091,15 +1194,12 @@ def measure_route(network, source_reach, source_candidates,
                 network.node_points[destination["node"]]
             )
             total = source_candidate["cost"] + gap + destination["cost"]
-            # Several combinations usually come to the same total. Prefer the
-            # one with the shortest bridge, so the gap reported is the real
-            # break in the trays rather than a diagonal across the building.
-            # The totals are compared with a tolerance: they are sums of
-            # floats and never match to the last bit.
             if fallback is None:
                 fallback = (total, source_candidate, destination, gap)
                 continue
-            tie = feet(TIE_TOLERANCE_MM)
+            # Several combinations usually come to the same total. Prefer the
+            # shortest hop, so the gap reported is the real break in the
+            # trays rather than a diagonal across the building.
             if (total < fallback[0] - tie
                     or (total < fallback[0] + tie and gap < fallback[3])):
                 fallback = (total, source_candidate, destination, gap)
@@ -1111,14 +1211,13 @@ def measure_route(network, source_reach, source_candidates,
         "network_length": 0.0,
         "source": source_candidate,
         "destination": destination,
-        "path_nodes": [source_candidate["node"], destination["node"]],
         "path_edges": [],
         "bridge": gap,
         "points": route_polyline(
-            network, source_candidate, destination,
-            [source_candidate["node"], destination["node"]], [], True
+            network, source_candidate, destination, [], True
         ),
     }
+
 
 # =============================================================================
 # Building the route list
@@ -1544,6 +1643,28 @@ def report_lines(result, values, network):
             len(network.trays), len(network.node_points),
             network.fitting_count, values["tolerance"]
         ),
+    ]
+    if network.bridge_edges:
+        lines.append(
+            "  The trays are modelled as separate pieces: {} hop(s) of up to "
+            "{:g} mm were added to join them up, {:.2f} m in all. Routes "
+            "follow the trays and cross these gaps only where they must."
+            .format(network.bridge_edges,
+                    values.get("bridge_gap", DEFAULT_BRIDGE_GAP_MM),
+                    metres(network.bridge_length))
+        )
+    if network.component_count > 1:
+        lines.append(
+            "  WARNING: the trays still fall into {} separate group(s) that "
+            "do not join up. Routes between groups have to cross open space. "
+            "Raise the connection tolerance or the gap-joining distance, or "
+            "join the trays in the model.".format(network.component_count)
+        )
+    lines.extend([
+        "Off-tray travel costs {:g} x its length, so a route follows the "
+        "trays unless there is no tray path at all.".format(
+            values.get("preference", DEFAULT_TRAY_PREFERENCE)
+        ),
         "",
         "Cable allowance: {:g} %  (the drop is worked out on the length "
         "with allowance)".format(values["allowance"]),
@@ -1554,7 +1675,7 @@ def report_lines(result, values, network):
             values["current"], values["voltage"]
         ),
         "",
-    ]
+    ])
     if routes:
         longest = max(routes, key=lambda item: item["with_allowance"])
         worst = max(routes, key=lambda item: item["drop_percent"])
@@ -1990,8 +2111,27 @@ SETUP_XAML = """
                        Style="{StaticResource Label}"/>
             <TextBox x:Name="tbTolerance"
                      ToolTip="Tray ends this far apart are treated as connected. Raise it when the model has small gaps between tray runs; lower it to measure only what is truly joined."/>
+            <Grid Margin="0,10,0,0">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="10"/>
+                <ColumnDefinition Width="*"/>
+              </Grid.ColumnDefinitions>
+              <StackPanel Grid.Column="0">
+                <TextBlock Text="Join tray gaps up to (mm)"
+                           Style="{StaticResource Label}"/>
+                <TextBox x:Name="tbBridge"
+                         ToolTip="Where the trays are modelled as separate runs that stop short of each other, gaps up to this are joined so a route can hop across and carry on along the next run. 0 turns it off."/>
+              </StackPanel>
+              <StackPanel Grid.Column="2">
+                <TextBlock Text="Prefer trays (x length)"
+                           Style="{StaticResource Label}"/>
+                <TextBox x:Name="tbPreference"
+                         ToolTip="How much a route sticks to the trays. Travel off a tray - the drop from the panel, and any hop across a gap - costs this many times its length, so at 8 the route follows eight metres of tray rather than cross one metre of open space. 1 turns the preference off."/>
+              </StackPanel>
+            </Grid>
             <TextBlock Style="{StaticResource Hint}" Margin="0,5,0,12"
-                       Text="Routes follow the modelled tray centre lines. Where the trays do not join up, the gap is bridged orthogonally and the route is flagged."/>
+                       Text="Routes follow the modelled tray centre lines. Where no tray path exists at all, the route crosses open space and is flagged in the preview."/>
             <CheckBox x:Name="cbDraw" Margin="0,0,0,0"
                       ToolTip="After the preview you can draw the ticked routes as red detail lines in the plan views of both end levels.">
               <TextBlock Text="Offer to draw red detail lines"
@@ -2119,6 +2259,8 @@ class SetupWindow(forms.WPFWindow):
         self.tbMvAm.Text = settings["mv_per_a_m"]
         self.tbLimit.Text = settings["limit_percent"]
         self.tbMaxPair.Text = settings["max_pair_metres"]
+        self.tbBridge.Text = settings.get("bridge_gap", "3000")
+        self.tbPreference.Text = settings.get("preference", "8")
         self.tbModelSummary.Text = (
             "{} electrical equipment item(s) that can act as a panel.\n"
             "{} isolator(s) found by Comments, JAC-EL-Rating or family "
@@ -2259,6 +2401,11 @@ class SetupWindow(forms.WPFWindow):
                     self.tbLimit.Text, "Voltage drop limit", minimum=0.0),
                 "max_pair_metres": self.read_number(
                     self.tbMaxPair.Text, "Pair length limit", minimum=0.0),
+                "bridge_gap": self.read_number(
+                    self.tbBridge.Text, "Tray gap joining distance",
+                    minimum=0.0),
+                "preference": self.read_number(
+                    self.tbPreference.Text, "Tray preference", minimum=1.0),
             }
             self.values = values
             self.Close()
@@ -2283,6 +2430,10 @@ def values_to_settings(values):
         "mv_per_a_m": "{:g}".format(values["mv_per_a_m"]),
         "limit_percent": "{:g}".format(values["limit_percent"]),
         "max_pair_metres": "{:g}".format(values["max_pair_metres"]),
+        "bridge_gap": "{:g}".format(values.get(
+            "bridge_gap", DEFAULT_BRIDGE_GAP_MM)),
+        "preference": "{:g}".format(values.get(
+            "preference", DEFAULT_TRAY_PREFERENCE)),
     }
 
 # =============================================================================
@@ -3736,6 +3887,13 @@ save_settings(user_config, values_to_settings(values))
 
 # ---- 4. The tray network -----------------------------------------------------
 network = TrayNetwork(values["tolerance"])
+# Real models usually have the trays in separate pieces. Join the pieces that
+# nearly touch, and make off-tray travel expensive, so routes follow the trays
+# instead of striking out across the building.
+network.bridge_gaps(
+    values.get("bridge_gap", DEFAULT_BRIDGE_GAP_MM),
+    values.get("preference", DEFAULT_TRAY_PREFERENCE)
+)
 if not network.ready:
     forms.alert(
         "The cable trays in this model gave no usable centre lines.",

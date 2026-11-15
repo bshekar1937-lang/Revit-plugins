@@ -166,8 +166,7 @@ namespace PanelCableRoute.UI
         private readonly RouteResult _result;
         private readonly RouteOptions _options;
         private readonly List<TraySegment> _trays;
-        private readonly int _nodeCount;
-        private readonly int _fittingsBridged;
+        private readonly TrayNetwork _network;
         private readonly ObservableCollection<RouteRow> _rows =
             new ObservableCollection<RouteRow>();
         private ICollectionView _view;
@@ -197,14 +196,13 @@ namespace PanelCableRoute.UI
 
         public ResultWindow(
             RouteResult result, RouteOptions options,
-            List<TraySegment> trays, int nodeCount, int fittingsBridged)
+            List<TraySegment> trays, TrayNetwork network)
         {
             InitializeComponent();
             _result = result;
             _options = options;
             _trays = trays;
-            _nodeCount = nodeCount;
-            _fittingsBridged = fittingsBridged;
+            _network = network;
             Choice = ResultChoice.Close;
             Exported = new List<string>();
 
@@ -260,8 +258,7 @@ namespace PanelCableRoute.UI
                 _result.Routes.Count, _result.Panels.Count, over,
                 _options.LimitPercent);
             OverviewText.Text = string.Join(Environment.NewLine,
-                Export.Report(_result, _options, _trays.Count, _nodeCount,
-                    _fittingsBridged).ToArray());
+                Export.Report(_result, _options, _network).ToArray());
         }
 
         private int TickedCount()
@@ -701,8 +698,7 @@ namespace PanelCableRoute.UI
             try
             {
                 List<string> lines = Export.Report(
-                    _result, _options, _trays.Count, _nodeCount,
-                    _fittingsBridged);
+                    _result, _options, _network);
                 string text = string.Join(Environment.NewLine, lines.ToArray())
                     + Environment.NewLine + Environment.NewLine
                     + Export.Tabbed(Export.Rows(Ticked(), _options));

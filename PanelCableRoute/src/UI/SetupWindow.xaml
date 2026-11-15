@@ -280,8 +280,27 @@
                          Style="{StaticResource Label}"/>
               <TextBox x:Name="ToleranceBox"
                        ToolTip="Tray ends this far apart are treated as connected. Raise it when the model has small gaps between tray runs; lower it to measure only what is truly joined."/>
+              <Grid Margin="0,10,0,0">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="10"/>
+                  <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0">
+                  <TextBlock Text="Join tray gaps up to (mm)"
+                             Style="{StaticResource Label}"/>
+                  <TextBox x:Name="BridgeBox"
+                           ToolTip="Where the trays are modelled as separate runs that stop short of each other, gaps up to this are joined so a route can hop across and carry on along the next run. 0 turns it off."/>
+                </StackPanel>
+                <StackPanel Grid.Column="2">
+                  <TextBlock Text="Prefer trays (x length)"
+                             Style="{StaticResource Label}"/>
+                  <TextBox x:Name="PreferenceBox"
+                           ToolTip="How much a route sticks to the trays. Travel off a tray - the drop from the panel, and any hop across a gap - costs this many times its length, so at 8 the route will follow eight metres of tray rather than cross one metre of open space. 1 turns the preference off."/>
+                </StackPanel>
+              </Grid>
               <TextBlock Style="{StaticResource Hint}" Margin="0,5,0,12"
-                         Text="Routes follow the modelled tray centre lines. Where the trays do not join up, the gap is bridged in a straight line and the route is flagged."/>
+                         Text="Routes follow the modelled tray centre lines. Where no tray path exists at all, the route crosses open space and is flagged in the preview."/>
               <CheckBox x:Name="DrawCheck"
                         ToolTip="After the preview you can draw the ticked routes as red detail lines in the plan views of both end levels.">
                 <TextBlock Text="Offer to draw red detail lines"

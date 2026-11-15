@@ -51,6 +51,8 @@ namespace PanelCableRoute.UI
             CurrentBox.Text = Text(remembered.Current);
             VoltageBox.Text = Text(remembered.Voltage);
             ToleranceBox.Text = Text(remembered.ToleranceMm);
+            BridgeBox.Text = Text(remembered.MaxBridgeMm);
+            PreferenceBox.Text = Text(remembered.TrayPreference);
             MaxPairBox.Text = Text(remembered.MaxPairMetres);
 
             for (int index = 0; index < panels.Count; index++)
@@ -324,6 +326,10 @@ namespace PanelCableRoute.UI
                     ToleranceBox, "Tray connection tolerance", 1.0);
                 options.MaxPairMetres = Read(
                     MaxPairBox, "Pair length limit", 0.0);
+                options.MaxBridgeMm = Read(
+                    BridgeBox, "Tray gap joining distance", 0.0);
+                options.TrayPreference = Read(
+                    PreferenceBox, "Tray preference", 1.0);
                 if (AllPanelsCheck.IsChecked != true)
                 {
                     options.PanelIds = new HashSet<long>(_selected);

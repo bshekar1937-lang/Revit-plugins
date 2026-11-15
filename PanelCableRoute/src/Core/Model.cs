@@ -111,6 +111,17 @@ namespace PanelCableRoute.Core
         public double LimitPercent = 5.0;
         /// <summary>Panel pairs longer than this are dropped. 0 keeps every pair.</summary>
         public double MaxPairMetres = 0.0;
+        /// <summary>
+        /// Groups of trays whose ends come this close are joined, so a route
+        /// can hop the gap and carry on along the next run. 0 turns it off.
+        /// </summary>
+        public double MaxBridgeMm = 3000.0;
+        /// <summary>
+        /// How much a route prefers trays. A hop through the air costs this
+        /// many times its length, so at 8 the router will follow up to eight
+        /// metres of tray rather than cross one metre of open space.
+        /// </summary>
+        public double TrayPreference = 8.0;
 
         /// <summary>Ids of the panels to measure. Empty means every panel.</summary>
         public HashSet<long> PanelIds = new HashSet<long>();
@@ -134,6 +145,8 @@ namespace PanelCableRoute.Core
             copy.MilliVoltsPerAmpMetre = MilliVoltsPerAmpMetre;
             copy.LimitPercent = LimitPercent;
             copy.MaxPairMetres = MaxPairMetres;
+            copy.MaxBridgeMm = MaxBridgeMm;
+            copy.TrayPreference = TrayPreference;
             copy.PanelIds = new HashSet<long>(PanelIds);
             return copy;
         }

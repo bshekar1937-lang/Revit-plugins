@@ -28,6 +28,8 @@ namespace PanelCableRoute.CoreTests
             TubeGeometry();
             BuilderEndToEnd();
             IsolatorsBehindEquipment();
+            BridgingBrokenTrayRuns();
+            TrayPreferenceBeatsAShortHop();
 
             Console.WriteLine();
             if (_failures == 0)
@@ -571,6 +573,102 @@ namespace PanelCableRoute.CoreTests
                 delegate (int done, int total, string name) { return false; });
             True("cancelling is recorded", stopped.Cancelled);
             True("and nothing was measured", stopped.Routes.Count == 0);
+        }
+
+        private static void BridgingBrokenTrayRuns()
+        {
+            Head("Tray runs that stop short of each other");
+            // Three runs in a line with 1 m gaps: the model is in pieces, as
+            // a real one usually is where the trays were not joined up.
+            List<TraySegment> trays = new List<TraySegment>
+            {
+                Tray(1, P(0, 0, 0), P(10, 0, 0)),
+                Tray(2, P(11, 0, 0), P(21, 0, 0)),
+                Tray(3, P(22, 0, 0), P(32, 0, 0))
+            };
+            TrayNetwork loose = Network(trays, 100.0);
+            int before;
+            loose.BridgeGaps(0.0, 8.0);         // 0 = do not bridge anything
+            before = loose.ComponentCount;
+            True("without bridging there are three separate groups",
+                before == 3);
+
+            TrayNetwork joined = Network(trays, 100.0);
+            joined.BridgeGaps(3000.0, 8.0);
+            True("bridging joins them into one", joined.ComponentCount == 1);
+            True("two hops were added", joined.BridgeEdgeCount == 2);
+            Near("and they total the real gap (m)",
+                Metres(joined.BridgeLengthAdded), 2.0);
+
+            RouteMeasurement route = Between(
+                joined, P(0, -1, 0), P(32, -1, 0));
+            True("a route was found", route != null);
+            Near("total (m)", Metres(route.Total), 34.0);
+            Near("of which along the trays (m)",
+                Metres(route.Source.PartialLength + route.NetworkLength
+                    + route.Destination.PartialLength), 30.0);
+            Near("and hopped (m)", Metres(route.Bridge), 2.0);
+            True("the route runs through the tray edges, not across open "
+                + "space", route.PathEdges.Count >= 4);
+            int trayEdges = 0;
+            int bridgeEdges = 0;
+            for (int index = 0; index < route.PathEdges.Count; index++)
+            {
+                if (route.PathEdges[index].Kind == EdgeKind.Bridge)
+                {
+                    bridgeEdges++;
+                }
+                else
+                {
+                    trayEdges++;
+                }
+            }
+            // The first run is covered by the source's own leg along it
+            // rather than by a graph edge, so two or three edges are both
+            // right; what matters is that the trays carry the route.
+            True("the tray runs were followed", trayEdges >= 2);
+            True("with two hops between them", bridgeEdges == 2);
+        }
+
+        private static void TrayPreferenceBeatsAShortHop()
+        {
+            Head("A tray way round against a short hop through the air");
+            // Two runs in line with a 2 m gap, and a short tray alongside
+            // that nearly touches both of them (200 mm at each end). The
+            // route can either hop the 2 m gap in one go, or take two tiny
+            // hops and 2 m of tray.
+            List<TraySegment> trays = new List<TraySegment>
+            {
+                Tray(1, P(0, 0, 0), P(10, 0, 0)),
+                Tray(2, P(12, 0, 0), P(22, 0, 0)),
+                Tray(3, P(10, 0.2, 0), P(12, 0.2, 0))
+            };
+
+            // Raw length only: the single 2 m hop is the shortest way.
+            TrayNetwork plain = Network(trays, 100.0);
+            plain.BridgeGaps(3000.0, 1.0);
+            RouteMeasurement direct = Between(plain, P(0, -1, 0), P(22, -1, 0));
+            Near("no preference: it hops the 2 m gap in one go (m)",
+                Metres(direct.Bridge), 2.0);
+            Near("and stays on 20 m of tray (m)",
+                Metres(direct.Source.PartialLength + direct.NetworkLength
+                    + direct.Destination.PartialLength), 20.0);
+
+            // Preferring trays: two 200 mm hops and the short tray cost less
+            // than one 2 m hop, even though the route is longer.
+            TrayNetwork preferred = Network(trays, 100.0);
+            preferred.BridgeGaps(3000.0, 8.0);
+            RouteMeasurement around = Between(
+                preferred, P(0, -1, 0), P(22, -1, 0));
+            Near("preferring trays: only the two short hops (m)",
+                Metres(around.Bridge), 0.4);
+            Near("and 22 m of tray, the extra run included (m)",
+                Metres(around.Source.PartialLength + around.NetworkLength
+                    + around.Destination.PartialLength), 22.0);
+            Near("the reported total is the real length, not the weighted "
+                + "one (m)", Metres(around.Total), 24.4);
+            True("it is the longer route, which is the point of preferring "
+                + "trays", around.Total > direct.Total);
         }
 
         private static void IsolatorsBehindEquipment()

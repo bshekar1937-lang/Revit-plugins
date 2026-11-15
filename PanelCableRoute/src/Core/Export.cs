@@ -119,8 +119,7 @@ namespace PanelCableRoute.Core
 
         /// <summary>The overview text, also used for the clipboard.</summary>
         public static List<string> Report(
-            RouteResult result, RouteOptions options,
-            int trayCount, int nodeCount, int fittingsBridged)
+            RouteResult result, RouteOptions options, TrayNetwork network)
         {
             List<string> lines = new List<string>();
             int circuits = 0;
@@ -171,8 +170,31 @@ namespace PanelCableRoute.Core
             lines.Add(string.Format(CultureInfo.InvariantCulture,
                 "Tray network: {0} tray(s), {1} node(s), {2} fitting(s) "
                 + "bridging tray ends, {3} mm connection tolerance.",
-                trayCount, nodeCount, fittingsBridged,
-                Number(options.ToleranceMm, 2)));
+                network.TrayCount, network.NodeCount,
+                network.FittingsBridged, Number(options.ToleranceMm, 2)));
+            if (network.BridgeEdgeCount > 0)
+            {
+                lines.Add(string.Format(CultureInfo.InvariantCulture,
+                    "  The trays were modelled as separate pieces: {0} hop(s) "
+                    + "of up to {1} mm were added to join them up, {2:0.00} m "
+                    + "in total. Routes follow the trays and cross these gaps "
+                    + "only where they must.",
+                    network.BridgeEdgeCount, Number(options.MaxBridgeMm, 0),
+                    Units.FeetToMetres(network.BridgeLengthAdded)));
+            }
+            if (network.ComponentCount > 1)
+            {
+                lines.Add(string.Format(CultureInfo.InvariantCulture,
+                    "  WARNING: the trays still fall into {0} separate "
+                    + "group(s) that do not join up. Routes between groups "
+                    + "have to cross open space. Raise the connection "
+                    + "tolerance or the gap-joining distance, or join the "
+                    + "trays in the model.", network.ComponentCount));
+            }
+            lines.Add(string.Format(CultureInfo.InvariantCulture,
+                "Off-tray travel costs {0} times its length, so a route "
+                + "follows the trays unless there is no tray path at all.",
+                Number(options.TrayPreference, 2)));
             lines.Add("");
             lines.Add(string.Format(CultureInfo.InvariantCulture,
                 "Cable allowance: {0} %  (the drop is worked out on the "

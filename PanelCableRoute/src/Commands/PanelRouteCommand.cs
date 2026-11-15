@@ -94,6 +94,12 @@ namespace PanelCableRoute.Commands
                 // ---- 3. the network and the electrical topology ----------
                 TrayNetwork network = new TrayNetwork(
                     trays, fittings, options.ToleranceMm);
+                // Real models often have the trays in separate pieces. Join
+                // the pieces that nearly touch, and make off-tray travel
+                // expensive, so routes follow the trays instead of striking
+                // out across the building.
+                network.BridgeGaps(
+                    options.MaxBridgeMm, options.TrayPreference);
                 if (network.NodeCount == 0)
                 {
                     TaskDialog.Show(Title,
@@ -163,8 +169,7 @@ namespace PanelCableRoute.Commands
 
                 // ---- 5. preview, then draw or export ---------------------
                 ResultWindow window = new ResultWindow(
-                    result, options, trays, network.NodeCount,
-                    network.FittingsBridged);
+                    result, options, trays, network);
                 window.SelectInRevit = delegate (List<long> ids, bool zoom)
                 {
                     return Focus(uiDocument, ids, zoom);
