@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Revit reads every *.addin file in its add-ins folder at startup.
+  Assembly path is relative to THIS file, so the DLL lives in a sub-folder.
+  Generate your own GUID for AddInId (Visual Studio: Tools > Create GUID).
+-->
+<RevitAddIns>
+  <AddIn Type="Application">
+    <Name>My Revit Add-in</Name>
+    <Assembly>MyRevitAddin\MyRevitAddin.dll</Assembly>
+    <FullClassName>MyRevitAddin.App</FullClassName>
+    <AddInId>7D3B6C1E-2F4A-4C8B-9E5D-1A2B3C4D5E6F</AddInId>
+    <VendorId>MYCO</VendorId>
+    <VendorDescription>My Company, www.example.com</VendorDescription>
+  </AddIn>
+</RevitAddIns>
