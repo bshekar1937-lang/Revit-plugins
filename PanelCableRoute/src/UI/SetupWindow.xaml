@@ -1,0 +1,338 @@
+<Window x:Class="PanelCableRoute.UI.SetupWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Panel Cable Route Pro" Width="900" SizeToContent="Height"
+        ResizeMode="NoResize" WindowStartupLocation="CenterOwner"
+        ShowInTaskbar="False" Background="#F1F4F9"
+        FontFamily="Segoe UI" FontSize="12" Foreground="#1E293B"
+        UseLayoutRounding="True">
+  <Window.Resources>
+    <Style x:Key="Card" TargetType="Border">
+      <Setter Property="Background" Value="White"/>
+      <Setter Property="BorderBrush" Value="#E2E8F0"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="10"/>
+      <Setter Property="Padding" Value="18,16"/>
+      <Setter Property="Margin" Value="0,0,0,14"/>
+    </Style>
+    <Style x:Key="Badge" TargetType="Border">
+      <Setter Property="Width" Value="24"/>
+      <Setter Property="Height" Value="24"/>
+      <Setter Property="CornerRadius" Value="12"/>
+      <Setter Property="Background" Value="#DBEAFE"/>
+      <Setter Property="Margin" Value="0,0,10,0"/>
+    </Style>
+    <Style x:Key="BadgeText" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="#1D4ED8"/>
+      <Setter Property="FontWeight" Value="Bold"/>
+      <Setter Property="HorizontalAlignment" Value="Center"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+    <Style x:Key="CardTitle" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="14"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Foreground" Value="#0F172A"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+    <Style x:Key="Label" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="#334155"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Margin" Value="0,0,0,5"/>
+    </Style>
+    <Style x:Key="Hint" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="#64748B"/>
+      <Setter Property="FontSize" Value="11"/>
+      <Setter Property="TextWrapping" Value="Wrap"/>
+      <Setter Property="Margin" Value="0,5,0,0"/>
+    </Style>
+    <Style TargetType="CheckBox">
+      <Setter Property="Margin" Value="0,0,0,9"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+    </Style>
+    <Style TargetType="TextBox">
+      <Setter Property="Height" Value="30"/>
+      <Setter Property="Padding" Value="8,0"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+      <Setter Property="BorderBrush" Value="#CBD5E1"/>
+    </Style>
+    <Style x:Key="PrimaryButton" TargetType="Button">
+      <Setter Property="Foreground" Value="White"/>
+      <Setter Property="Background" Value="#2563EB"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Height" Value="36"/>
+      <Setter Property="Padding" Value="20,0"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bd" Background="{TemplateBinding Background}"
+                    CornerRadius="8" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center"
+                                VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bd" Property="Background" Value="#1D4ED8"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="SecondaryButton" TargetType="Button">
+      <Setter Property="Foreground" Value="#334155"/>
+      <Setter Property="Background" Value="White"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Height" Value="36"/>
+      <Setter Property="Padding" Value="16,0"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bd" Background="{TemplateBinding Background}"
+                    BorderBrush="#CBD5E1" BorderThickness="1"
+                    CornerRadius="8" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center"
+                                VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bd" Property="Background" Value="#F1F5F9"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+
+  <Grid>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <!-- Header -->
+    <Border Grid.Row="0" Padding="24,18">
+      <Border.Background>
+        <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+          <GradientStop Color="#1E3A8A" Offset="0"/>
+          <GradientStop Color="#2563EB" Offset="1"/>
+        </LinearGradientBrush>
+      </Border.Background>
+      <DockPanel>
+        <Border DockPanel.Dock="Left" Width="46" Height="46" CornerRadius="10"
+                Background="#33FFFFFF" Margin="0,0,14,0">
+          <Path Stroke="White" StrokeThickness="2.4" StrokeLineJoin="Round"
+                StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                HorizontalAlignment="Center" VerticalAlignment="Center"
+                Data="M 3,20 L 3,8 L 11,8 L 11,20 M 19,20 L 19,8 L 27,8 L 27,20 M 7,14 L 23,14"/>
+        </Border>
+        <StackPanel VerticalAlignment="Center">
+          <TextBlock Text="Panel Cable Route Pro" FontSize="20"
+                     FontWeight="SemiBold" Foreground="White"/>
+          <TextBlock Text="Panel-to-panel cable tray lengths for voltage-drop calculations"
+                     FontSize="12" Foreground="#DBEAFE" Margin="0,2,0,0"/>
+        </StackPanel>
+      </DockPanel>
+    </Border>
+
+    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+      <Grid Margin="20,18,20,4">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="16"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+
+        <StackPanel Grid.Column="0">
+          <Border Style="{StaticResource Card}">
+            <StackPanel>
+              <DockPanel Margin="0,0,0,14">
+                <Border Style="{StaticResource Badge}">
+                  <TextBlock Text="1" Style="{StaticResource BadgeText}"/>
+                </Border>
+                <TextBlock Text="What to measure"
+                           Style="{StaticResource CardTitle}"/>
+              </DockPanel>
+              <CheckBox x:Name="PairsCheck"
+                        ToolTip="Measure the tray route between every pair of panels in scope. This is what gives a distance from any panel to any panel.">
+                <TextBlock Text="Panel to panel - every pair"
+                           FontWeight="SemiBold" Foreground="#334155"/>
+              </CheckBox>
+              <CheckBox x:Name="CircuitsCheck"
+                        ToolTip="Measure from each panel to the equipment on its own circuits, using the circuit's current and voltage for the drop.">
+                <TextBlock Text="Panel to the equipment on its circuits"
+                           FontWeight="SemiBold" Foreground="#334155"/>
+              </CheckBox>
+              <CheckBox x:Name="IsolatorsCheck"
+                        ToolTip="Also measure to isolators - tagged in Comments or JAC-EL-Rating, or named one - including those wired behind the equipment.">
+                <TextBlock Text="Include isolators" FontWeight="SemiBold"
+                           Foreground="#334155"/>
+              </CheckBox>
+              <TextBlock Text="Ignore panel pairs longer than (m)"
+                         Style="{StaticResource Label}" Margin="0,4,0,5"/>
+              <TextBox x:Name="MaxPairBox"
+                       ToolTip="Drops pairs whose route is longer than this, to keep the table to connections that could actually be cabled. 0 keeps every pair."/>
+            </StackPanel>
+          </Border>
+
+          <Border Style="{StaticResource Card}">
+            <StackPanel>
+              <DockPanel Margin="0,0,0,12">
+                <Border Style="{StaticResource Badge}">
+                  <TextBlock Text="2" Style="{StaticResource BadgeText}"/>
+                </Border>
+                <TextBlock Text="Panels in scope"
+                           Style="{StaticResource CardTitle}"/>
+              </DockPanel>
+              <CheckBox x:Name="AllPanelsCheck" IsChecked="True"
+                        Checked="OnAllPanelsChanged"
+                        Unchecked="OnAllPanelsChanged">
+                <TextBlock x:Name="AllPanelsText" Text="All panels"
+                           FontWeight="SemiBold" Foreground="#334155"/>
+              </CheckBox>
+              <TextBox x:Name="PanelFilterBox" Margin="0,0,0,6"
+                       TextChanged="OnPanelFilterChanged"
+                       ToolTip="Type part of a panel name, mark, comment or ID to narrow the list."/>
+              <ListBox x:Name="PanelList" Height="150"
+                       SelectionMode="Extended" BorderBrush="#CBD5E1"
+                       SelectionChanged="OnPanelSelectionChanged"
+                       ToolTip="Ctrl-click or shift-click to choose the panels to measure."/>
+              <TextBlock x:Name="ScopeText" Style="{StaticResource Hint}"/>
+            </StackPanel>
+          </Border>
+        </StackPanel>
+
+        <StackPanel Grid.Column="2">
+          <Border Style="{StaticResource Card}">
+            <StackPanel>
+              <DockPanel Margin="0,0,0,14">
+                <Border Style="{StaticResource Badge}">
+                  <TextBlock Text="3" Style="{StaticResource BadgeText}"/>
+                </Border>
+                <TextBlock Text="Cable and voltage drop"
+                           Style="{StaticResource CardTitle}"/>
+              </DockPanel>
+              <Grid Margin="0,0,0,12">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="10"/>
+                  <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0">
+                  <TextBlock Text="Cable allowance (%)"
+                             Style="{StaticResource Label}"/>
+                  <TextBox x:Name="AllowanceBox" TextChanged="OnInputChanged"
+                           ToolTip="Added to the measured route for terminations, slack and drops. The voltage drop is worked out on the length including this allowance."/>
+                </StackPanel>
+                <StackPanel Grid.Column="2">
+                  <TextBlock Text="Cable mV/A/m"
+                             Style="{StaticResource Label}"/>
+                  <TextBox x:Name="MvAmBox" TextChanged="OnInputChanged"
+                           ToolTip="The figure from the cable manufacturer's table for the size you intend to use. It is a property of the cable, not of the model."/>
+                </StackPanel>
+              </Grid>
+              <Grid Margin="0,0,0,12">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="10"/>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="10"/>
+                  <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0">
+                  <TextBlock Text="Limit (%)" Style="{StaticResource Label}"/>
+                  <TextBox x:Name="LimitBox" TextChanged="OnInputChanged"
+                           ToolTip="Routes whose drop is over this are flagged in the table and the export. 5% total, or 3% for a final circuit, is usual."/>
+                </StackPanel>
+                <StackPanel Grid.Column="2">
+                  <TextBlock Text="Current (A)" Style="{StaticResource Label}"/>
+                  <TextBox x:Name="CurrentBox" TextChanged="OnInputChanged"
+                           ToolTip="Used when the connection is not a Revit circuit, or the circuit carries no current. Circuit currents are read from the model and take precedence."/>
+                </StackPanel>
+                <StackPanel Grid.Column="4">
+                  <TextBlock Text="Voltage (V)" Style="{StaticResource Label}"/>
+                  <TextBox x:Name="VoltageBox" TextChanged="OnInputChanged"
+                           ToolTip="Nominal voltage used when the circuit does not give one."/>
+                </StackPanel>
+              </Grid>
+              <Border Background="#EFF6FF" CornerRadius="6" Padding="10,8">
+                <TextBlock x:Name="SummaryText" TextWrapping="Wrap"
+                           Foreground="#1E3A8A" FontSize="11.5"/>
+              </Border>
+              <TextBlock Style="{StaticResource Hint}"
+                         Text="drop (V) = mV/A/m x current x length / 1000, and the percentage is of the nominal voltage. Three-phase cable tables already allow for the phase configuration."/>
+            </StackPanel>
+          </Border>
+
+          <Border Style="{StaticResource Card}">
+            <StackPanel>
+              <DockPanel Margin="0,0,0,14">
+                <Border Style="{StaticResource Badge}">
+                  <TextBlock Text="4" Style="{StaticResource BadgeText}"/>
+                </Border>
+                <TextBlock Text="Tray network and output"
+                           Style="{StaticResource CardTitle}"/>
+              </DockPanel>
+              <TextBlock Text="Tray connection tolerance (mm)"
+                         Style="{StaticResource Label}"/>
+              <TextBox x:Name="ToleranceBox"
+                       ToolTip="Tray ends this far apart are treated as connected. Raise it when the model has small gaps between tray runs; lower it to measure only what is truly joined."/>
+              <Grid Margin="0,10,0,0">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="10"/>
+                  <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0">
+                  <TextBlock Text="Join tray gaps up to (mm)"
+                             Style="{StaticResource Label}"/>
+                  <TextBox x:Name="BridgeBox"
+                           ToolTip="Where the trays are modelled as separate runs that stop short of each other, gaps up to this are joined so a route can hop across and carry on along the next run. 0 turns it off."/>
+                </StackPanel>
+                <StackPanel Grid.Column="2">
+                  <TextBlock Text="Prefer trays (x length)"
+                             Style="{StaticResource Label}"/>
+                  <TextBox x:Name="PreferenceBox"
+                           ToolTip="How much a route sticks to the trays. Travel off a tray - the drop from the panel, and any hop across a gap - costs this many times its length, so at 8 the route will follow eight metres of tray rather than cross one metre of open space. 1 turns the preference off."/>
+                </StackPanel>
+              </Grid>
+              <TextBlock Style="{StaticResource Hint}" Margin="0,5,0,12"
+                         Text="Routes follow the modelled tray centre lines. Where no tray path exists at all, the route crosses open space and is flagged in the preview."/>
+              <CheckBox x:Name="DrawCheck"
+                        ToolTip="After the preview you can draw the ticked routes as red detail lines in the plan views of both end levels.">
+                <TextBlock Text="Offer to draw red detail lines"
+                           FontWeight="SemiBold" Foreground="#334155"/>
+              </CheckBox>
+              <Border Background="#F8FAFC" BorderBrush="#E2E8F0"
+                      BorderThickness="1" CornerRadius="6" Padding="10,8">
+                <TextBlock x:Name="ModelText" TextWrapping="Wrap"
+                           Foreground="#334155" FontSize="11.5"/>
+              </Border>
+            </StackPanel>
+          </Border>
+        </StackPanel>
+      </Grid>
+    </ScrollViewer>
+
+    <!-- Footer -->
+    <Border Grid.Row="2" Background="White" BorderBrush="#E2E8F0"
+            BorderThickness="0,1,0,0" Padding="20,14">
+      <DockPanel>
+        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal"
+                    VerticalAlignment="Center">
+          <Button x:Name="CancelButton" Content="Cancel" IsCancel="True"
+                  Style="{StaticResource SecondaryButton}" Margin="0,0,10,0"
+                  Click="OnCancel"/>
+          <Button x:Name="RunButton" Content="Measure routes" IsDefault="True"
+                  Style="{StaticResource PrimaryButton}" Click="OnRun"/>
+        </StackPanel>
+        <TextBlock VerticalAlignment="Center" TextWrapping="Wrap"
+                   Foreground="#64748B" FontSize="11" Margin="0,0,16,0"
+                   Text="Nothing is changed in the model while measuring. The preview opens when the routes are ready, and you choose there whether to draw or export."/>
+      </DockPanel>
+    </Border>
+  </Grid>
+</Window>
