@@ -1,28 +1,33 @@
 # -*- coding: utf-8 -*-
 __title__ = "LIGHT\nPLACEMENT 2D"
 __doc__ = (
-    "Place a 2D family you choose at every lighting fixture of a linked model. "
-    "Each linked fixture type is matched to a type of the 2D family with the same "
-    "name (types you already created are reused); missing types are created as new "
-    "types. Review the matching, then symbols are placed at the centre of each "
-    "linked fixture and rotated to match it. One Ctrl+Z undoes everything."
+    "AUTOMATIC: places your 2D lighting symbols at every lighting fixture of the "
+    "linked model - no picking. The link, the 2D family and the type for each "
+    "linked fixture are found automatically (types you already created are "
+    "reused, missing ones are created). Shift+Click to change the remembered "
+    "link / 2D family."
 )
 
 # =============================================================================
-# LIGHT PLACEMENT 2D
-#   1. Pick the linked model.
-#   2. Pick YOUR 2D family (Lighting Fixture / Detail Item / Generic Annotation)
-#      and the type new types are duplicated from.
-#   3. Review the matching  linked "Family : Type"  ->  type of your 2D family.
-#        EXISTING  = a type with the same name already exists - it is reused
-#        NEW TYPE  = no match - a new type with the linked type name is created
-#      Untick a row to skip it; you can also change the type used for any row.
-#   4. Options: centre / insertion point, rotation, skip duplicates, Comments.
-#   5. Everything is placed in ONE transaction (one Ctrl+Z undoes it).
+# LIGHT PLACEMENT 2D  -  fully automatic
+#   Click            -> runs with no questions:
+#     * link       : the loaded link that contains lighting fixtures
+#                    (the one used last time if there are several)
+#     * 2D family  : the family whose existing types match the linked fixture
+#                    types best (remembered for next time)
+#     * types      : each linked "Family : Type" is matched to the closest
+#                    existing type name (spaces, dashes, case and word order
+#                    ignored); no match -> a new type named after the linked type
+#     * position   : centre of each linked fixture, rotated to match it
+#     * duplicates : positions that already have the same symbol are skipped,
+#                    so running it again only adds what is missing
+#   Shift+Click      -> choose the link / 2D family again (saved for next runs)
 #
+# The output window lists every linked type and the 2D type it was matched to.
+# One transaction: a single Ctrl+Z undoes everything.
 # Model families (2D lighting fixture families) are placed at each fixture's
-# height on the nearest level below. View-specific families (detail items,
-# generic annotations) are placed in the ACTIVE PLAN VIEW.
+# height; view-specific families (detail items / generic annotations) are
+# placed in the ACTIVE PLAN VIEW.
 # Revit 2023 - 2027, pyRevit (IronPython engine).
 # =============================================================================
 
@@ -50,13 +55,15 @@ from Autodesk.Revit.DB import (
     ElementTransformUtils,
 )
 from Autodesk.Revit.DB.Structure import StructuralType
-from pyrevit import forms, script
+from pyrevit import EXEC_PARAMS, forms, script
 
 
 uidoc = __revit__.ActiveUIDocument
 doc = uidoc.Document
 active_view = doc.ActiveView
 output = script.get_output()
+config = script.get_config()
+choose_again = EXEC_PARAMS.config_mode   # True on Shift+Click
 
 DUPLICATE_TOLERANCE = 50.0 / 304.8          # 50 mm in feet
 INVALID_NAME_CHARS = u"\\:{}[]|;<>?`~"
@@ -216,49 +223,126 @@ class Option(object):
 
 
 # -----------------------------------------------------------------------------
-# 1. Linked model
+# Name matching (automatic)
 # -----------------------------------------------------------------------------
-links = []
+import re
+
+STOP_WORDS = set(["type", "family", "light", "lighting", "fixture", "fixtures", "luminaire", "2d", "3d"])
+
+
+def norm(text):
+    """'Downlight_600 x 600 - LED' -> 'downlight600x600led'"""
+    return re.sub(r"[^0-9a-z]", "", (text or u"").lower())
+
+
+def tokens(text):
+    words = re.findall(r"[0-9a-z]+", (text or u"").lower())
+    return set(w for w in words if w not in STOP_WORDS)
+
+
+def match_score(target_name, linked_family, linked_type):
+    """0 - 100: how well a 2D type name fits a linked Family : Type."""
+    t = norm(target_name)
+    if not t:
+        return 0
+    lt = norm(linked_type)
+    lf = norm(linked_family)
+    if t == lt:
+        return 100
+    if t == lf + lt or t == lt + lf:
+        return 98
+    if t == lf:
+        return 85
+    best = 0
+    # one name contains the other (e.g. "DL01" in "DL01 - Downlight 600")
+    for source in (lt, lf + lt):
+        if len(t) >= 3 and len(source) >= 3 and (t in source or source in t):
+            ratio = float(min(len(t), len(source))) / max(len(t), len(source))
+            best = max(best, int(60 + 30 * ratio))
+    # shared words, any order (e.g. "LED Panel 600" vs "600 Panel LED")
+    target_words = tokens(target_name)
+    linked_words = tokens(linked_type) | tokens(linked_family)
+    if target_words and linked_words:
+        common = target_words & linked_words
+        jaccard = float(len(common)) / len(target_words | linked_words)
+        coverage = float(len(common)) / len(target_words)
+        best = max(best, int(45 * jaccard + 35 * coverage))
+    return best
+
+
+AUTO_MATCH = 60   # score needed to reuse an existing 2D type
+
+
+def best_symbol(symbols, key):
+    best, best_score = None, 0
+    for symbol in symbols:
+        score = match_score(type_name(symbol), key[0], key[1])
+        if score > best_score:
+            best, best_score = symbol, score
+    return (best, best_score) if best_score >= AUTO_MATCH else (None, best_score)
+
+
+def collect_groups(link_doc):
+    result = {}
+    for fixture in FilteredElementCollector(link_doc) \
+            .OfCategory(BuiltInCategory.OST_LightingFixtures) \
+            .OfClass(FamilyInstance):
+        if fixture.Symbol is None or fixture.SuperComponent is not None:
+            continue
+        key = (fixture.Symbol.FamilyName, type_name(fixture.Symbol))
+        result.setdefault(key, []).append(fixture)
+    return result
+
+
+# -----------------------------------------------------------------------------
+# 1. Link (automatic)
+# -----------------------------------------------------------------------------
+candidates = []
 for link_instance in FilteredElementCollector(doc).OfClass(RevitLinkInstance):
     try:
-        if link_instance.GetLinkDocument():
-            links.append(link_instance)
+        link_doc = link_instance.GetLinkDocument()
     except Exception:
-        pass
-if not links:
-    forms.alert("No loaded Revit links were found.\nLoad the linked model first (Manage > Manage Links).",
-                exitscript=True)
-
-link_options = sorted(
-    [Option(u"{}   ({})".format(l.GetLinkDocument().Title, l.Name), l) for l in links],
-    key=lambda option: option.name.lower())
-picked = forms.SelectFromList.show(link_options, title="1. Select the linked model",
-                                   name_attr="name", button_name="Next")
-if not picked:
-    script.exit()
-link = picked.value
-linked_doc = link.GetLinkDocument()
-transform = link.GetTotalTransform()
-
-# linked fixtures grouped by (Family, Type); nested sub-components skipped
-groups = {}
-for fixture in FilteredElementCollector(linked_doc) \
-        .OfCategory(BuiltInCategory.OST_LightingFixtures) \
-        .OfClass(FamilyInstance):
-    if fixture.Symbol is None or fixture.SuperComponent is not None:
+        link_doc = None
+    if link_doc is None:
         continue
-    key = (fixture.Symbol.FamilyName, type_name(fixture.Symbol))
-    groups.setdefault(key, []).append(fixture)
-if not groups:
-    forms.alert("The selected link has no lighting fixtures.", exitscript=True)
+    found = collect_groups(link_doc)
+    if found:
+        candidates.append((link_instance, link_doc, found))
+if not candidates:
+    forms.alert("No loaded Revit link contains lighting fixtures.\n"
+                "Load the lighting link first (Manage > Manage Links).", exitscript=True)
+
+
+def link_label(item):
+    return u"{}   ({} fixtures)".format(item[1].Title, sum(len(v) for v in item[2].values()))
+
+
+chosen = None
+if len(candidates) == 1:
+    chosen = candidates[0]
+else:
+    remembered = getattr(config, "link_title", None)
+    if remembered and not choose_again:
+        chosen = next((c for c in candidates if c[1].Title == remembered), None)
+    if chosen is None:
+        picked = forms.SelectFromList.show(
+            [Option(link_label(c), c) for c in candidates], name_attr="name",
+            title="Several links have lighting fixtures - pick one (remembered next time)",
+            button_name="Use this link")
+        if not picked:
+            script.exit()
+        chosen = picked.value
+link, linked_doc, groups = chosen
+transform = link.GetTotalTransform()
+config.link_title = linked_doc.Title
 group_keys = sorted(groups.keys(), key=lambda k: (k[0].lower(), k[1].lower()))
 
 
 # -----------------------------------------------------------------------------
-# 2. Your 2D family and the base type for new types
+# 2. 2D family (automatic: best name match, remembered)
 # -----------------------------------------------------------------------------
 category_ids = set(int(c) for c in TARGET_CATEGORIES)
-family_options = []
+families = []
 for family in FilteredElementCollector(doc).OfClass(Family):
     try:
         category = family.FamilyCategory
@@ -269,135 +353,84 @@ for family in FilteredElementCollector(doc).OfClass(Family):
     symbols = [doc.GetElement(i) for i in family.GetFamilySymbolIds()]
     symbols = sorted([s for s in symbols if s], key=lambda s: type_name(s).lower())
     if symbols:
-        family_options.append(Option(u"{}:  {}".format(category.Name, family.Name), (family, symbols)))
-if not family_options:
+        families.append((family, symbols, category.Name))
+if not families:
     forms.alert("No Lighting Fixture, Detail Item or Generic Annotation families are loaded.\n"
                 "Load your 2D family first (Insert > Load Family).", exitscript=True)
-family_options.sort(key=lambda option: option.name.lower())
 
-picked = forms.SelectFromList.show(family_options, title="2. Select YOUR 2D family (type to search)",
-                                   name_attr="name", button_name="Next")
-if not picked:
-    script.exit()
-family, family_symbols = picked.value
+linked_family_names = set(norm(k[0]) for k in group_keys)
+
+
+def family_fit(item):
+    family, symbols, _ = item
+    if norm(family.Name) in linked_family_names:
+        return -1        # that is the linked 3D family itself, not a 2D symbol family
+    matched = sum(1 for key in group_keys if best_symbol(symbols, key)[0] is not None)
+    bonus = 0.5 if "2d" in family.Name.lower() or "symbol" in family.Name.lower() else 0
+    return matched + bonus
+
+
+chosen_family = None
+remembered = getattr(config, "family_name", None)
+if remembered and not choose_again:
+    chosen_family = next((f for f in families if f[0].Name == remembered), None)
+if chosen_family is None and not choose_again:
+    ranked = sorted(families, key=family_fit, reverse=True)
+    if family_fit(ranked[0]) >= 1:
+        chosen_family = ranked[0]
+if chosen_family is None:
+    ranked = sorted(families, key=family_fit, reverse=True)
+    picked = forms.SelectFromList.show(
+        [Option(u"{}:  {}".format(f[2], f[0].Name), f) for f in ranked], name_attr="name",
+        title="Pick your 2D symbol family ONCE (remembered; Shift+Click to change)",
+        button_name="Use this family")
+    if not picked:
+        script.exit()
+    chosen_family = picked.value
+family, family_symbols, _ = chosen_family
+config.family_name = family.Name
+script.save_config()
+
 view_based = family.FamilyPlacementType == FamilyPlacementType.ViewBased
 if view_based and not isinstance(active_view, ViewPlan):
     forms.alert("'{}' is a view-specific family (detail item / annotation).\n\n"
                 "Open a floor or ceiling plan view first, then run the tool again.".format(family.Name),
                 exitscript=True)
-
-if len(family_symbols) == 1:
-    base_symbol = family_symbols[0]
-else:
-    picked = forms.SelectFromList.show(
-        [Option(type_name(s), s) for s in family_symbols],
-        title="New types are duplicated from which type of '{}'?".format(family.Name),
-        name_attr="name", button_name="Next")
-    if not picked:
-        script.exit()
-    base_symbol = picked.value
+base_symbol = family_symbols[0]
 
 
 # -----------------------------------------------------------------------------
-# 3. Type matching (review)
+# 3. Type matching (automatic)
 # -----------------------------------------------------------------------------
-# type names used by more than one linked family become "Family - Type"
 type_to_families = {}
 for fam_name, typ_name in group_keys:
-    type_to_families.setdefault(typ_name.lower(), set()).add(fam_name)
+    type_to_families.setdefault(norm(typ_name), set()).add(fam_name)
 
-mapping = {}   # key -> ("existing", symbol) | ("new", name) | ("skip", None)
+mapping = {}       # key -> ("existing", symbol) | ("new", name)
+match_rows = []
 for key in group_keys:
     fam_name, typ_name = key
-    shared = len(type_to_families[typ_name.lower()]) > 1
-    new_name = clean_name(u"{} - {}".format(fam_name, typ_name) if shared else typ_name)
-    match = None
-    for symbol in family_symbols:
-        name = type_name(symbol)
-        if same(name, typ_name) or same(name, new_name) or same(name, u"{} - {}".format(fam_name, typ_name)):
-            match = symbol
-            break
-    mapping[key] = ("existing", match) if match else ("new", new_name)
-
-
-def describe(key):
-    kind, value = mapping[key]
-    count = len(groups[key])
-    label = u"{} : {}".format(key[0], key[1])
-    if kind == "existing":
-        return u"EXISTING   {}   ->   {}   ({} pcs)".format(label, type_name(value), count)
-    if kind == "new":
-        return u"NEW TYPE   {}   ->   + {}   ({} pcs)".format(label, value, count)
-    return u"SKIP       {}   ({} pcs)".format(label, count)
-
-
-while True:
-    rows = [forms.TemplateListItem(Option(describe(key), key), checked=mapping[key][0] != "skip",
-                                   name_attr="name")
-            for key in group_keys]
-    picked = forms.SelectFromList.show(
-        rows, multiselect=True, name_attr="name", button_name="Accept matching",
-        title="3. Review: ticked rows are placed (EXISTING = your type reused, NEW TYPE = created)")
-    if picked is None:
-        script.exit()
-    ticked = set(option.value for option in picked)
-    for key in group_keys:
-        if key not in ticked:
-            mapping[key] = ("skip", None)
-        elif mapping[key][0] == "skip":            # re-ticked: back to name matching
-            fam_name, typ_name = key
-            new_name = clean_name(typ_name)
-            match = next((s for s in family_symbols if same(type_name(s), typ_name)), None)
-            mapping[key] = ("existing", match) if match else ("new", new_name)
-
-    if not forms.alert("Do you want to change the type used for any linked type?",
-                       yes=True, no=True, title="Review matching"):
-        break
-    to_change = forms.SelectFromList.show(
-        [Option(describe(key), key) for key in group_keys],
-        multiselect=True, name_attr="name", button_name="Change selected",
-        title="Pick the linked types to change")
-    for option in (to_change or []):
-        key = option.value
-        fam_name, typ_name = key
-        choices = [Option(u"+ New type: {}".format(clean_name(typ_name)), ("new", clean_name(typ_name)))]
-        choices += [Option(type_name(s), ("existing", s)) for s in family_symbols]
-        choices.append(Option(u"(Skip - do not place)", ("skip", None)))
-        choice = forms.SelectFromList.show(
-            choices, name_attr="name", button_name="Use this type",
-            title=u"Place '{} : {}' as".format(fam_name, typ_name))
-        if choice:
-            mapping[key] = choice.value
-
-if all(mapping[key][0] == "skip" for key in group_keys):
-    forms.alert("Every type is set to Skip - nothing to place.", exitscript=True)
+    symbol, score = best_symbol(family_symbols, key)
+    if symbol is not None:
+        mapping[key] = ("existing", symbol)
+        match_rows.append([u"{} : {}".format(fam_name, typ_name), len(groups[key]),
+                           type_name(symbol), "existing ({}%)".format(score)])
+    else:
+        shared = len(type_to_families[norm(typ_name)]) > 1
+        new_name = clean_name(u"{} - {}".format(fam_name, typ_name) if shared else typ_name)
+        mapping[key] = ("new", new_name)
+        match_rows.append([u"{} : {}".format(fam_name, typ_name), len(groups[key]),
+                           new_name, "NEW type"])
 
 
 # -----------------------------------------------------------------------------
-# 4. Options
+# 4. Options (fixed defaults - no questions)
 # -----------------------------------------------------------------------------
-position = forms.CommandSwitchWindow.show(
-    ["Centre of linked fixture", "Insertion point of linked fixture"],
-    message="4. Place each symbol at:")
-if not position:
-    script.exit()
-use_centre = position.startswith("Centre")
-
-OPT_ROTATE = "Rotate symbols to match the linked fixtures"
-OPT_DUPES = "Skip positions that already have the same symbol (within 50 mm)"
-OPT_COMMENTS = "Write link name, linked ID and linked type into Comments"
-OPT_LEVEL = "View-specific family: only fixtures on the active view's level"
-option_names = [OPT_ROTATE, OPT_DUPES, OPT_COMMENTS] + ([OPT_LEVEL] if view_based else [])
-picked = forms.SelectFromList.show(
-    [forms.TemplateListItem(name, checked=True) for name in option_names],
-    multiselect=True, title="Options (untick what you do not want)", button_name="Place symbols")
-if picked is None:
-    script.exit()
-rotate = OPT_ROTATE in picked
-skip_dupes = OPT_DUPES in picked
-write_comments = OPT_COMMENTS in picked
-only_view_level = OPT_LEVEL in picked
-
+use_centre = True
+rotate = True
+skip_dupes = True
+write_comments = True
+only_view_level = True
 
 # -----------------------------------------------------------------------------
 # 5. Place
@@ -525,6 +558,10 @@ if skipped:
 if failed:
     summary.append("{} could not be placed - see the output window.".format(len(failed)))
 
+output.print_md("**Link:** {}  |  **2D family:** {}".format(linked_doc.Title, family.Name))
+output.print_table(table_data=match_rows,
+                   columns=["Linked fixture (Family : Type)", "Qty", "Placed as 2D type", "Match"],
+                   title="Type matching")
 if placed_per_type:
     output.print_table(
         table_data=[[name, count] for name, count in sorted(placed_per_type.items())],
@@ -537,5 +574,6 @@ if failed:
     output.print_table(table_data=failed, columns=["Linked type", "Linked ID", "Reason"],
                        title="Not placed")
 
-forms.alert("\n".join(summary) + "\n\nOne Ctrl+Z undoes everything.",
+forms.alert("\n".join(summary) + "\n\nLink: {}\n2D family: {}\n\nThe output window shows which 2D type each linked type got.\n"
+            "One Ctrl+Z undoes everything. Shift+Click to change link / family.".format(linked_doc.Title, family.Name),
             title="Light Placement 2D")
