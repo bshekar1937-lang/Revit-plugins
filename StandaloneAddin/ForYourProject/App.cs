@@ -42,6 +42,18 @@ namespace MyRevitCommands
                 };
                 panel.AddItem(panelDistance);
 
+                var lightPlacement = new PushButtonData(
+                    "LightPlacement2D",
+                    "Light\nPlacement",
+                    dll,
+                    typeof(LightPlacementCommand).FullName)
+                {
+                    ToolTip = "Place your 2D family at every lighting fixture of a linked model (matches or creates types).",
+                    LargeImage = MakeIcon(32, "LP", "#D97706"),
+                    Image = MakeIcon(16, "L", "#D97706")
+                };
+                panel.AddItem(lightPlacement);
+
                 // To add another tool later, copy the block above:
                 // var other = new PushButtonData("OtherTool", "Other\nTool", dll, typeof(OtherCommand).FullName) { ... };
                 // panel.AddItem(other);
