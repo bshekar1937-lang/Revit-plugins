@@ -2,18 +2,18 @@
 __title__ = "LIGHT\nPLACEMENT 2D"
 __doc__ = (
     "AUTOMATIC: places your 2D lighting symbols at every lighting fixture of the "
-    "linked model - no picking. The link, the 2D family and the type for each "
+    "linked model. You pick the link; the 2D family and the type for each "
     "linked fixture are found automatically (types you already created are "
     "reused, missing ones are created) and the linked WATTAGE is copied. A 3D "
-    "preview is shown before anything is placed. Shift+Click to change the "
-    "remembered link / 2D family."
+    "preview is shown before placing, and afterwards every fixture is checked "
+    "(position, type, wattage). Shift+Click to change the 2D family."
 )
 
 # =============================================================================
 # LIGHT PLACEMENT 2D  -  fully automatic
 #   Click            -> runs with no questions:
-#     * link       : the loaded link that contains lighting fixtures
-#                    (the one used last time if there are several)
+#     * link       : ASKED every time (list shows each link's fixture count;
+#                    the link used last time is at the top)
 #     * 2D family  : the family whose existing types match the linked fixture
 #                    types best (remembered for next time)
 #     * types      : each linked "Family : Type" is matched to the closest
@@ -28,7 +28,10 @@ __doc__ = (
 #     * preview    : a window with a 3D preview, the type matching (with
 #                    wattage) and a summary - nothing changes until you press
 #                    "Place symbols"
-#   Shift+Click      -> choose the link / 2D family again (saved for next runs)
+#     * verify     : after placing, every linked fixture is checked: is there a
+#                    2D symbol at its position, of the right type, with the
+#                    same wattage? Problems are listed (clickable) and selected
+#   Shift+Click      -> choose the 2D family again (saved for next runs)
 #
 # The output window lists every linked type and the 2D type it was matched to.
 # One transaction: a single Ctrl+Z undoes everything.
@@ -305,7 +308,7 @@ def collect_groups(link_doc):
 
 
 # -----------------------------------------------------------------------------
-# 1. Link (automatic)
+# 1. Link (ALWAYS asked - every loaded link with its lighting fixture count)
 # -----------------------------------------------------------------------------
 candidates = []
 for link_instance in FilteredElementCollector(doc).OfClass(RevitLinkInstance):
@@ -315,34 +318,37 @@ for link_instance in FilteredElementCollector(doc).OfClass(RevitLinkInstance):
         link_doc = None
     if link_doc is None:
         continue
-    found = collect_groups(link_doc)
-    if found:
-        candidates.append((link_instance, link_doc, found))
+    candidates.append((link_instance, link_doc, collect_groups(link_doc)))
 if not candidates:
-    forms.alert("No loaded Revit link contains lighting fixtures.\n"
+    forms.alert("No loaded Revit links were found.\n"
                 "Load the lighting link first (Manage > Manage Links).", exitscript=True)
 
 
+def fixture_count(item):
+    return sum(len(v) for v in item[2].values())
+
+
 def link_label(item):
-    return u"{}   ({} fixtures)".format(item[1].Title, sum(len(v) for v in item[2].values()))
+    count = fixture_count(item)
+    types = len(item[2])
+    return u"{}   ({}) - {} lighting fixture(s), {} type(s)".format(
+        item[1].Title, item[0].Name, count, types) if count else u"{}   ({}) - no lighting fixtures".format(
+        item[1].Title, item[0].Name)
 
 
-chosen = None
-if len(candidates) == 1:
-    chosen = candidates[0]
-else:
-    remembered = getattr(config, "link_title", None)
-    if remembered and not choose_again:
-        chosen = next((c for c in candidates if c[1].Title == remembered), None)
-    if chosen is None:
-        picked = forms.SelectFromList.show(
-            [Option(link_label(c), c) for c in candidates], name_attr="name",
-            title="Several links have lighting fixtures - pick one (remembered next time)",
-            button_name="Use this link")
-        if not picked:
-            script.exit()
-        chosen = picked.value
-link, linked_doc, groups = chosen
+remembered = getattr(config, "link_title", None)
+# last used link first, then links with the most fixtures
+candidates.sort(key=lambda c: (c[1].Title != remembered, -fixture_count(c), c[1].Title.lower()))
+picked = forms.SelectFromList.show(
+    [Option(link_label(c), c) for c in candidates], name_attr="name",
+    title="1. Copy lighting fixtures FROM which linked model?",
+    button_name="Use this link")
+if not picked:
+    script.exit()
+link, linked_doc, groups = picked.value
+if not groups:
+    forms.alert(u"'{}' has no lighting fixtures. Run again and pick another link.".format(linked_doc.Title),
+                exitscript=True)
 transform = link.GetTotalTransform()
 config.link_title = linked_doc.Title
 group_keys = sorted(groups.keys(), key=lambda k: (k[0].lower(), k[1].lower()))
@@ -938,7 +944,7 @@ class PreviewWindow(object):
             lines.append(u"Wattage is written to: {}".format(
                 u"'{}' ({} parameter)".format(probe_param.Definition.Name, probe_level) if probe_param is not None
                 else u"the placed symbol's own 'Wattage' instance parameter if it has one."))
-        lines += [u"", u"Shift+Click the button to choose another link or 2D family.",
+        lines += [u"", u"Shift+Click the button to choose another 2D family.",
                   u"One Ctrl+Z undoes everything."]
         block = text_block(u"\n".join(lines), 13, False, "#0F172A", Thickness(16))
         frame = Border()
@@ -973,6 +979,9 @@ created_types = []
 failed = []
 placed_per_type = {}
 type_watts = {}        # type-level wattage: symbol id -> set of values written
+# 2D type name each linked type should end up with (updated with the real names below)
+final_type = dict((key, type_name(mapping[key][1]) if mapping[key][0] == "existing" else mapping[key][1])
+                  for key in group_keys)
 
 
 def apply_watts(instance, item):
@@ -1012,6 +1021,9 @@ try:
         except Exception as error:
             failed.append([u"{} : {}".format(*key), "", u"New type '{}' not created: {}".format(value, error)])
 
+    for key in group_keys:
+        if key in symbol_for:
+            final_type[key] = type_name(symbol_for[key])
     for symbol in symbol_for.values():
         if not symbol.IsActive:
             symbol.Activate()
@@ -1069,7 +1081,105 @@ except Exception:
 
 
 # -----------------------------------------------------------------------------
-# 9. Report
+# 9. VERIFY - is every linked fixture copied properly?
+# -----------------------------------------------------------------------------
+WATT_TOLERANCE = 0.5      # W
+
+host_symbols = []         # (point, type name, instance)
+verify_collector = FilteredElementCollector(doc, active_view.Id) if view_based else FilteredElementCollector(doc)
+for instance in verify_collector.OfClass(FamilyInstance):
+    symbol = instance.Symbol
+    if symbol and symbol.Family and symbol.Family.Id == family.Id \
+            and isinstance(instance.Location, LocationPoint):
+        host_symbols.append((instance.Location.Point, type_name(symbol), instance))
+
+# bucket the host symbols on a 2D grid so each lookup is fast
+cell = DUPLICATE_TOLERANCE
+buckets = {}
+for entry in host_symbols:
+    point = entry[0]
+    buckets.setdefault((int(math.floor(point.X / cell)), int(math.floor(point.Y / cell))), []).append(entry)
+
+
+def nearest_host(point):
+    cx, cy = int(math.floor(point.X / cell)), int(math.floor(point.Y / cell))
+    best, best_distance = None, None
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for entry in buckets.get((cx + dx, cy + dy), []):
+                if not is_near(entry[0], point, view_based):
+                    continue
+                distance = entry[0].DistanceTo(point) if not view_based else \
+                    math.hypot(entry[0].X - point.X, entry[0].Y - point.Y)
+                if best is None or distance < best_distance:
+                    best, best_distance = entry, distance
+    return best
+
+
+verify_rows = {}          # key -> [linked qty, ok, missing, wrong type, wattage issue]
+problems = []             # [status, linked type, linked id, host element, detail]
+problem_ids = []
+checked = 0
+for item in items:
+    if item.status in ("outside", "noloc"):
+        continue
+    checked += 1
+    row = verify_rows.setdefault(item.key, [0, 0, 0, 0, 0])
+    row[0] += 1
+    label = u"{} : {}".format(*item.key)
+    expected = final_type.get(item.key)
+    host = nearest_host(item.point)
+    if host is None:
+        row[2] += 1
+        problems.append(["MISSING", label, id_value(item.fixture.Id), "-",
+                         u"no 2D symbol at the linked position"])
+        continue
+    point, actual_type, instance = host
+    if expected and not same(actual_type, expected):
+        row[3] += 1
+        problems.append(["WRONG TYPE", label, id_value(item.fixture.Id), output.linkify(instance.Id),
+                         u"is '{}', expected '{}'".format(actual_type, expected)])
+        problem_ids.append(instance.Id)
+        continue
+    if copy_watts and item.watts is not None:
+        parameter, _ = target_wattage_parameter(instance, instance.Symbol, item.watt_name)
+        host_watts, host_text = read_watts(parameter) if parameter is not None else (None, None)
+        if host_watts is None or abs(host_watts - item.watts) > WATT_TOLERANCE:
+            row[4] += 1
+            problems.append(["WATTAGE", label, id_value(item.fixture.Id), output.linkify(instance.Id),
+                             u"host {} / link {}".format(host_text or "empty", item.watt_text)])
+            problem_ids.append(instance.Id)
+            continue
+    row[1] += 1
+
+total_ok = sum(r[1] for r in verify_rows.values())
+output.print_md(u"## Verification: {} of {} linked fixture(s) copied correctly".format(total_ok, checked))
+output.print_table(
+    table_data=[[u"{} : {}".format(*key), final_type.get(key, u"-")] + verify_rows[key]
+                for key in group_keys if key in verify_rows],
+    columns=["Linked fixture (Family : Type)", "2D type", "Linked qty", "OK", "Missing", "Wrong type",
+             "Wattage issue"],
+    title="Check per type")
+if problems:
+    output.print_table(table_data=problems[:500],
+                       columns=["Problem", "Linked type", "Linked ID", "Host symbol (click)", "Detail"],
+                       title=u"Problems ({})".format(len(problems)))
+    if len(problems) > 500:
+        output.print_md(u"... and {} more.".format(len(problems) - 500))
+if problem_ids:
+    try:
+        from System.Collections.Generic import List as NetList
+        from Autodesk.Revit.DB import ElementId as NetElementId
+        selection = NetList[NetElementId]()
+        for element_id in problem_ids:
+            selection.Add(element_id)
+        uidoc.Selection.SetElementIds(selection)
+    except Exception:
+        pass
+
+
+# -----------------------------------------------------------------------------
+# 10. Report
 # -----------------------------------------------------------------------------
 conflicts = [[name, u", ".join(sorted(values))] for name, values in type_watts.items() if len(values) > 1]
 
@@ -1102,4 +1212,17 @@ if copy_watts:
                        u"'Wattage' to the 2D family.".format(watt_missing_target))
 if failed:
     summary.append(u"{} problem(s) - see the output window.".format(len(failed)))
+missing_count = sum(r[2] for r in verify_rows.values())
+wrong_count = sum(r[3] for r in verify_rows.values())
+watt_count = sum(r[4] for r in verify_rows.values())
+summary.append(u"")
+if total_ok == checked:
+    summary.append(u"CHECK OK: all {} linked fixture(s) have the right 2D symbol{}.".format(
+        checked, u" and wattage" if copy_watts and with_watts else u""))
+else:
+    summary.append(u"CHECK: {} of {} correct - {} missing, {} wrong type, {} wattage issue(s).".format(
+        total_ok, checked, missing_count, wrong_count, watt_count))
+    if problem_ids:
+        summary.append(u"The {} host symbol(s) with problems are selected in Revit.".format(len(problem_ids)))
+    summary.append(u"Details (with clickable IDs) are in the output window.")
 forms.alert(u"\n".join(summary) + u"\n\nOne Ctrl+Z undoes everything.", title="Light Placement 2D")
