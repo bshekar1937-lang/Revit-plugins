@@ -20,8 +20,10 @@ __doc__ = (
 #                    existing type name (spaces, dashes, case and word order
 #                    ignored); no match -> a new type named after the linked type
 #     * position   : centre of each linked fixture, rotated to match it
-#     * duplicates : positions that already have the same symbol are skipped,
-#                    so running it again only adds what is missing
+#     * existing   : 2D symbols placed earlier are paired with their linked
+#                    fixture (by the Comments ID, else the nearest one within
+#                    half the fixture size + 300 mm). If one is not at the
+#                    fixture CENTRE it is MOVED there; no duplicate is placed
 #     * wattage    : read from each linked fixture (instance or type) and
 #                    written to the placed 2D symbol (same parameter name, or
 #                    Wattage / Power / Apparent Load ...), units converted
@@ -553,30 +555,26 @@ def write_watts(parameter, watts, text):
 levels = sorted(FilteredElementCollector(doc).OfClass(Level), key=lambda level: level.Elevation)
 view_level = active_view.GenLevel if view_based else None
 
-# existing symbols of the chosen family: (symbol id, point, instance id)
-existing = []
-collector = FilteredElementCollector(doc, active_view.Id) if view_based else FilteredElementCollector(doc)
-for instance in collector.OfClass(FamilyInstance):
-    symbol = instance.Symbol
-    if symbol and symbol.Family and symbol.Family.Id == family.Id \
-            and isinstance(instance.Location, LocationPoint):
-        existing.append((type_name(symbol), instance.Location.Point, instance.Id))
-
-
 class FixtureItem(object):
     def __init__(self, key, fixture):
         self.key = key
         self.fixture = fixture
-        self.point, self.rotation = placement_of(fixture, transform, use_centre)
+        self.point, self.rotation = placement_of(fixture, transform, True)       # centre
+        self.insertion, _ = placement_of(fixture, transform, False)              # insertion point
         self.watts, self.watt_text, self.watt_name = linked_wattage(fixture)
-        self.status = "place"          # place | existing | outside | noloc
+        self.status = "place"          # place | existing (at centre) | move | outside | noloc
         self.existing_id = None
+        self.host_point = None
+        # search radius for an already placed symbol: half the fixture size + 300 mm
+        self.radius = 500.0 / 304.8
+        box = fixture.get_BoundingBox(None)
+        if box is not None:
+            half = math.hypot(box.Max.X - box.Min.X, box.Max.Y - box.Min.Y) / 2.0
+            self.radius = min(max(half + 300.0 / 304.8, 500.0 / 304.8), 3000.0 / 304.8)
 
 
 items = []
 for key in group_keys:
-    kind, value = mapping[key]
-    target_name = type_name(value) if kind == "existing" else value
     for fixture in groups[key]:
         item = FixtureItem(key, fixture)
         if item.point is None:
@@ -584,16 +582,78 @@ for key in group_keys:
         elif view_based and only_view_level and view_level is not None and levels \
                 and level_for(item.point.Z, levels).Id != view_level.Id:
             item.status = "outside"
-        elif skip_dupes:
-            for name, point, instance_id in existing:
-                if same(name, target_name) and is_near(point, item.point, view_based):
-                    item.status = "existing"
-                    item.existing_id = instance_id
-                    break
         items.append(item)
+
+# ---- symbols of the 2D family that are ALREADY in the model -----------------
+host_existing = []        # (point, instance)
+collector = FilteredElementCollector(doc, active_view.Id) if view_based else FilteredElementCollector(doc)
+for instance in collector.OfClass(FamilyInstance):
+    symbol = instance.Symbol
+    if symbol and symbol.Family and symbol.Family.Id == family.Id \
+            and isinstance(instance.Location, LocationPoint):
+        host_existing.append((instance.Location.Point, instance))
+
+
+def plan_distance(a, b):
+    return math.hypot(a.X - b.X, a.Y - b.Y)
+
+
+def same_height(a, b):
+    return view_based or abs(a.Z - b.Z) < 2000.0 / 304.8
+
+
+# 1) pair by the "ID <linked id>" text this tool writes into Comments
+active_items = [i for i in items if i.status == "place"]
+by_linked_id = dict((id_value(i.fixture.Id), i) for i in active_items)
+paired_hosts = set()
+for point, instance in host_existing:
+    comments = instance.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
+    text = comments.AsString() if comments else None
+    if not text or linked_doc.Title not in text:
+        continue
+    found = re.search(r"ID (\d+)", text)
+    item = by_linked_id.get(int(found.group(1))) if found else None
+    if item is not None and item.existing_id is None:
+        item.existing_id, item.host_point = instance.Id, point
+        paired_hosts.add(id_value(instance.Id))
+
+# 2) pair the rest by distance (nearest first, one symbol per linked fixture)
+grid_cell = 3000.0 / 304.8
+host_grid = {}
+for point, instance in host_existing:
+    if id_value(instance.Id) not in paired_hosts:
+        host_grid.setdefault((int(math.floor(point.X / grid_cell)), int(math.floor(point.Y / grid_cell))),
+                             []).append((point, instance))
+pairs = []
+for item in active_items:
+    if item.existing_id is not None:
+        continue
+    cx, cy = int(math.floor(item.point.X / grid_cell)), int(math.floor(item.point.Y / grid_cell))
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for point, instance in host_grid.get((cx + dx, cy + dy), []):
+                if not same_height(point, item.point):
+                    continue
+                distance = min(plan_distance(point, item.point),
+                               plan_distance(point, item.insertion) if item.insertion else 1e9)
+                if distance <= item.radius:
+                    pairs.append((distance, item, point, instance))
+pairs.sort(key=lambda pair: pair[0])
+for distance, item, point, instance in pairs:
+    if item.existing_id is not None or id_value(instance.Id) in paired_hosts:
+        continue
+    item.existing_id, item.host_point = instance.Id, point
+    paired_hosts.add(id_value(instance.Id))
+
+# 3) paired symbol already at the centre -> OK, otherwise it must be moved
+for item in active_items:
+    if item.existing_id is None:
+        continue
+    item.status = "existing" if is_near(item.host_point, item.point, view_based) else "move"
 
 to_place = [i for i in items if i.status == "place"]
 already = [i for i in items if i.status == "existing"]
+to_move = [i for i in items if i.status == "move"]
 outside = [i for i in items if i.status == "outside"]
 with_watts = [i for i in items if i.watts is not None]
 
@@ -681,7 +741,8 @@ def text_block(text, size=12, bold=False, color="#334155", margin=None):
 STATUS_COLORS = {
     "new_type": Color.FromRgb(245, 158, 11),     # amber  - will be placed with a NEW type
     "existing_type": Color.FromRgb(34, 211, 238),  # cyan - will be placed with your type
-    "existing": Color.FromRgb(100, 116, 139),     # grey  - already placed earlier
+    "existing": Color.FromRgb(100, 116, 139),     # grey  - already placed at the centre
+    "move": Color.FromRgb(168, 85, 247),          # purple - placed earlier, NOT centred: will be moved
     "outside": Color.FromRgb(239, 68, 68),        # red   - not on the active view level
 }
 
@@ -689,6 +750,8 @@ STATUS_COLORS = {
 def item_color_key(item):
     if item.status == "existing":
         return "existing"
+    if item.status == "move":
+        return "move"
     if item.status in ("outside", "noloc"):
         return "outside"
     return "existing_type" if mapping[item.key][0] == "existing" else "new_type"
@@ -723,8 +786,9 @@ class PreviewWindow(object):
         header.Background = brush("#1E3A8A")
         header.Children.Add(text_block("LIGHT PLACEMENT 2D", 20, True, "#FFFFFF", Thickness(18, 12, 18, 0)))
         header.Children.Add(text_block(
-            u"Link: {}   |   2D family: {}   |   {} fixture(s): {} to place, {} already placed{}".format(
-                linked_doc.Title, family.Name, len(items), len(to_place), len(already),
+            u"Link: {}   |   2D family: {}   |   {} fixture(s): {} to place, {} to move to centre, "
+            u"{} already at centre{}".format(
+                linked_doc.Title, family.Name, len(items), len(to_place), len(to_move), len(already),
                 u", {} not on this view's level".format(len(outside)) if outside else u""),
             12, False, "#DBEAFE", Thickness(18, 0, 18, 12)))
         DockPanel.SetDock(header, Dock.Top)
@@ -745,8 +809,13 @@ class PreviewWindow(object):
         cancel = make_button("Cancel", False)
         cancel.IsCancel = True
         cancel.Click += lambda sender, args: window.Close()
-        place = make_button(u"Place {} symbol(s)".format(len(to_place)) if to_place else "Update wattage only", True)
-        place.IsEnabled = bool(to_place) or bool(already and with_watts)
+        actions = []
+        if to_place:
+            actions.append(u"Place {}".format(len(to_place)))
+        if to_move:
+            actions.append(u"Move {} to centre".format(len(to_move)))
+        place = make_button(u", ".join(actions) if actions else "Update wattage only", True)
+        place.IsEnabled = bool(to_place) or bool(to_move) or bool(already and with_watts)
         place.Click += self.on_place
         buttons.Children.Add(self.watt_box)
         buttons.Children.Add(cancel)
@@ -785,7 +854,8 @@ class PreviewWindow(object):
         legend = StackPanel()
         legend.Orientation = Orientation.Horizontal
         for key, label in (("existing_type", "Your existing type"), ("new_type", "New type"),
-                           ("existing", "Already placed"), ("outside", "Not on view level")):
+                           ("existing", "Already at centre"), ("move", "Will be moved to centre"),
+                           ("outside", "Not on view level")):
             swatch = Border()
             swatch.Width = 12
             swatch.Height = 12
@@ -932,7 +1002,8 @@ class PreviewWindow(object):
             u"",
             u"{} linked lighting fixture(s) in {} type(s).".format(len(items), len(rows)),
             u"{} will be placed now.".format(len(to_place)),
-            u"{} already have a symbol at that position (wattage is refreshed on those).".format(len(already)),
+            u"{} symbol(s) placed earlier are NOT at the centre and will be moved to it.".format(len(to_move)),
+            u"{} already have a symbol at the centre (wattage is refreshed on those).".format(len(already)),
             u"{} use your existing types, {} new type(s) will be created.".format(
                 sum(1 for k in group_keys if mapping[k][0] == "existing"),
                 sum(1 for k in group_keys if mapping[k][0] == "new")),
@@ -973,6 +1044,7 @@ copy_watts = preview.copy_watts
 # 8. Place + copy wattage (one transaction)
 # -----------------------------------------------------------------------------
 placed = 0
+moved = []                # [linked type, host symbol link, distance moved mm]
 watt_written = 0
 watt_missing_target = 0
 created_types = []
@@ -1029,6 +1101,27 @@ try:
             symbol.Activate()
     doc.Regenerate()
 
+    # move symbols placed earlier to the centre of their linked fixture
+    for item in to_move:
+        label = u"{} : {}".format(*item.key)
+        instance = doc.GetElement(item.existing_id)
+        if instance is None:
+            continue
+        sub = SubTransaction(doc)
+        sub.Start()
+        try:
+            current = instance.Location.Point
+            delta = XYZ(item.point.X - current.X, item.point.Y - current.Y,
+                        0.0 if view_based else item.point.Z - current.Z)
+            ElementTransformUtils.MoveElement(doc, instance.Id, delta)
+            apply_watts(instance, item)
+            sub.Commit()
+            moved.append([label, output.linkify(instance.Id),
+                          int(round(math.hypot(delta.X, delta.Y) * 304.8))])
+        except Exception as error:
+            sub.RollBack()
+            failed.append([label, id_value(item.fixture.Id), u"move to centre: {}".format(error)])
+
     # refresh wattage on symbols placed in an earlier run
     for item in already:
         instance = doc.GetElement(item.existing_id)
@@ -1070,7 +1163,7 @@ try:
             sub.RollBack()
             failed.append([source_label, id_value(item.fixture.Id), str(error)])
 
-    if placed == 0 and not created_types and watt_written == 0:
+    if placed == 0 and not moved and not created_types and watt_written == 0:
         transaction.RollBack()
     else:
         transaction.Commit()
@@ -1204,6 +1297,9 @@ if placed_per_type:
                        columns=["2D type", "Placed"], title="Placed per type")
 if created_types:
     output.print_table(table_data=[[n] for n in created_types], columns=["New type"], title="New types created")
+if moved:
+    output.print_table(table_data=moved, columns=["Linked type", "2D symbol (click)", "Moved (mm)"],
+                       title=u"Moved to the centre of the linked fixture ({})".format(len(moved)))
 if conflicts:
     output.print_table(table_data=conflicts, columns=["2D type", "Different wattages written"],
                        title="Wattage is a TYPE parameter but the linked fixtures differ - make it an instance parameter")
@@ -1213,7 +1309,8 @@ if failed:
 summary = [
     u"{} symbol(s) placed.".format(placed),
     u"{} new type(s) created.".format(len(created_types)),
-    u"{} already placed earlier (skipped).".format(len(already)),
+    u"{} placed earlier moved to the fixture centre.".format(len(moved)),
+    u"{} were already at the centre.".format(len(already)),
 ]
 if outside:
     summary.append(u"{} skipped: not on the active view's level.".format(len(outside)))
