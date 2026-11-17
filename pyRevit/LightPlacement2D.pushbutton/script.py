@@ -633,10 +633,10 @@ from System.Windows import (Window, Thickness, GridLength, GridUnitType, FontWei
 from System.Windows.Controls import (DockPanel, Dock, StackPanel, TextBlock, Button, Border,
                                      TabControl, TabItem, ScrollViewer, ScrollBarVisibility,
                                      Grid as WpfGrid, ColumnDefinition, RowDefinition,
-                                     Orientation, CheckBox)
+                                     Orientation, CheckBox, Viewport3D)
 from System.Windows.Interop import WindowInteropHelper
 from System.Windows.Media import (SolidColorBrush, Brushes, Color, ColorConverter, FontFamily)
-from System.Windows.Media.Media3D import (Viewport3D, ModelVisual3D, Model3DGroup, GeometryModel3D,
+from System.Windows.Media.Media3D import (ModelVisual3D, Model3DGroup, GeometryModel3D,
                                           MeshGeometry3D, DiffuseMaterial, AmbientLight,
                                           DirectionalLight, PerspectiveCamera, Point3D, Vector3D)
 
