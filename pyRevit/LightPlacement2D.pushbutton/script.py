@@ -3,8 +3,9 @@ __title__ = "LIGHT\nPLACEMENT 2D"
 __doc__ = (
     "Choose a lighting link, the levels to process and one 2D annotation "
     "family. Existing matching types are reused and missing types are created "
-    "inside that family. A preview lets you place new symbols or update "
-    "existing symbols at matching locations."
+    "inside that family. Fixtures that already have a symbol within 350 mm are "
+    "left untouched (wiring and circuits are not changed); only new symbols are "
+    "added."
 )
 
 # =============================================================================
@@ -17,8 +18,11 @@ __doc__ = (
 #                    existing type name (spaces, dashes, case and word order
 #                    ignored); no match -> a new type in the selected family
 #     * position   : linked fixture insertion point, transformed to host coords
-#     * updates    : optionally change a different symbol already at the target
-#                    position to the type matching the linked fixture
+#     * existing   : if ANY symbol (chosen 2D family or a host lighting fixture)
+#                    is within 350 mm of the linked fixture on the same floor,
+#                    it counts as existing and is LEFT UNTOUCHED - no move, no
+#                    type change, no parameters, no circuit / wire changes.
+#                    Only linked fixtures with no symbol nearby get a new one.
 #     * wattage    : read from each linked fixture (instance or type) and
 #                    written to the placed 2D symbol (same parameter name, or
 #                    Wattage / Power / Apparent Load ...), units converted
@@ -64,7 +68,6 @@ from Autodesk.Revit.DB import (
     UnitUtils,
 )
 from Autodesk.Revit.DB.Structure import StructuralType
-from Autodesk.Revit.DB.Electrical import ElectricalCircuitPathMode, ElectricalSystem
 from pyrevit import EXEC_PARAMS, forms, script
 
 
@@ -224,31 +227,6 @@ def plan_view_for_level(view_id, level):
     except Exception:
         pass
     return None
-
-
-def align_instance(instance, item, view_based):
-    """Move and rotate an existing symbol to the linked fixture location."""
-    location = instance.Location
-    if not isinstance(location, LocationPoint):
-        raise Exception("Existing symbol has no point location.")
-
-    destination = target_point(item, view_based)
-    if point_distance(location.Point, destination, view_based) > ALIGN_TOLERANCE:
-        ElementTransformUtils.MoveElement(
-            doc, instance.Id, destination - location.Point
-        )
-        location = instance.Location
-
-    if rotate and abs(item.rotation) > 1e-6 and not is_face_hosted(instance):
-        rotation_delta = rotation_difference(item.rotation, location.Rotation)
-        if abs(rotation_delta) > ROTATION_TOLERANCE:
-            origin = location.Point
-            ElementTransformUtils.RotateElement(
-                doc, instance.Id,
-                Line.CreateBound(origin, origin + XYZ.BasisZ),
-                rotation_delta
-            )
-    check_elevation(instance, item)
 
 
 def placement_of(fixture, transform, use_centre):
@@ -823,146 +801,112 @@ for item in items:
             iter(views_by_level.get(id_value(item.target_level.Id), [])), None
         )
 
-# Existing instances from the chosen family, including instances in other
-# plan views so each selected level can be updated in its own view.
-existing = []
-for instance in FilteredElementCollector(doc).OfClass(FamilyInstance):
-    symbol = instance.Symbol
-    if symbol and symbol.Family and symbol.Family.Id == family.Id \
-            and isinstance(instance.Location, LocationPoint):
-        try:
-            owner_view_id = instance.OwnerViewId
-        except Exception:
-            owner_view_id = None
-        source_link_id, source_fixture_id = source_reference_from_comments(instance)
-        existing.append((
-            type_name(symbol), instance.Location.Point, instance,
-            owner_view_id, source_link_id, source_fixture_id
-        ))
+# -----------------------------------------------------------------------------
+# Existing symbols: anything within 350 mm (plan, same floor) of a linked
+# fixture counts as "already exists" and is LEFT UNTOUCHED - not moved, not
+# retyped, no parameters written, no circuit or wire changes.
+# Checked: every instance of the chosen 2D family (any view) and every host
+# Lighting Fixture (any family). A symbol covers only ONE linked fixture.
+# -----------------------------------------------------------------------------
+EXISTING_RADIUS = 350.0 / 304.8          # 350 mm in feet
 
-matched_existing_ids = set()
+existing = []        # (point, instance, owner view id, source link id, source fixture id)
+lighting_category = int(BuiltInCategory.OST_LightingFixtures)
+for instance in FilteredElementCollector(doc).OfClass(FamilyInstance):
+    try:
+        symbol = instance.Symbol
+        if symbol is None or not isinstance(instance.Location, LocationPoint):
+            continue
+        if instance.SuperComponent is not None:
+            continue                       # nested part of another family
+        in_family = symbol.Family is not None and symbol.Family.Id == family.Id
+        is_light = instance.Category is not None and id_value(instance.Category.Id) == lighting_category
+        if not (in_family or is_light):
+            continue
+        owner_view_id = instance.OwnerViewId
+        source_link_id, source_fixture_id = source_reference_from_comments(instance)
+        existing.append((instance.Location.Point, instance, owner_view_id,
+                         source_link_id, source_fixture_id))
+    except Exception:
+        continue
+
+
+def on_item_floor(record, item):
+    """True when the existing symbol belongs to the linked fixture's floor."""
+    point, instance, owner_view_id = record[0], record[1], record[2]
+    if owner_view_id is not None and owner_view_id != ElementId.InvalidElementId:
+        # view-specific symbol (detail item / annotation): its plan view's level
+        return plan_view_for_level(owner_view_id, item.target_level) is not None
+    try:
+        if instance.LevelId == item.target_level.Id:
+            return True
+    except Exception:
+        pass
+    return abs(point.Z - item.point.Z) < 1500.0 / 304.8
+
+
+eligible = []
 for item in items:
     if item.point is None:
         item.status = "noloc"
-        continue
-    if item.level is None:
+    elif item.level is None:
         item.status = "no_level"
-        continue
-    if id_value(item.level.Id) not in selected_level_ids:
+    elif id_value(item.level.Id) not in selected_level_ids:
         item.status = "outside"
-        continue
-    if item.target_level is None:
+    elif item.target_level is None:
         item.status = "no_host_level"
-        continue
-    if view_based and item.target_view is None:
+    elif view_based and item.target_view is None:
         item.status = "no_view"
+    else:
+        eligible.append(item)
+
+used_existing = set()
+
+# 1) symbols this tool placed earlier carry the linked ID in Comments
+by_fixture_id = dict((id_value(i.fixture.Id), i) for i in eligible)
+for record in existing:
+    source_link_id, source_fixture_id = record[3], record[4]
+    if source_fixture_id is None or (source_link_id is not None and source_link_id != id_value(link.Id)):
         continue
+    item = by_fixture_id.get(source_fixture_id)
+    if item is not None and item.existing_id is None:
+        item.existing_instance, item.existing_id = record[1], record[1].Id
+        item.existing_distance = point_distance(record[0], item.point, True)
+        item.status = "existing"
+        used_existing.add(id_value(record[1].Id))
 
-    if skip_dupes:
-        kind, value = mapping[item.key]
-        target_name = type_name(value) if kind == "existing" else value
-        destination = target_point(item, view_based)
-        match = None
+# 2) any other symbol within 350 mm (nearest pairs first, one-to-one)
+cell = EXISTING_RADIUS
+grid = {}
+for record in existing:
+    if id_value(record[1].Id) in used_existing:
+        continue
+    point = record[0]
+    grid.setdefault((int(math.floor(point.X / cell)), int(math.floor(point.Y / cell))), []).append(record)
 
-        # Script-created symbols keep the linked element id in Comments, so
-        # they can be found and realigned even if they drifted well away.
-        for record in existing:
-            name, point, instance, owner_view_id, source_link_id, source_fixture_id = record
-            instance_id = id_value(instance.Id)
-            if instance_id in matched_existing_ids \
-                    or source_fixture_id != id_value(item.fixture.Id) \
-                    or (source_link_id is not None
-                        and source_link_id != id_value(link.Id)):
-                continue
-            if view_based:
-                owner_view = plan_view_for_level(
-                    owner_view_id, item.target_level
-                )
-                if owner_view is None:
-                    continue
-                item.target_view = owner_view
-            match = record
-            break
-
-        # Prefer nearby untagged symbols of the chosen family, without reusing
-        # one existing symbol for more than one linked fixture.
-        if match is None:
-            nearest_distance = DUPLICATE_TOLERANCE
-            for record in existing:
-                name, point, instance, owner_view_id, source_link_id, source_fixture_id = record
-                if id_value(instance.Id) in matched_existing_ids \
-                        or source_fixture_id is not None:
-                    continue
-                if view_based:
-                    owner_view = plan_view_for_level(
-                        owner_view_id, item.target_level
-                    )
-                    if owner_view is None:
-                        continue
-                elif not same_floor(instance, destination, item):
-                    continue
-                # plan distance: a symbol at the WRONG HEIGHT is still found
-                # (and then corrected) instead of being duplicated
-                distance = point_distance(point, destination, True)
-                if distance < nearest_distance:
-                    nearest_distance = distance
-                    match = record
-                    if view_based:
-                        item.target_view = owner_view
-
-        # Older/manual symbols may be displaced by more than the proximity
-        # tolerance. If the type and level identify a clear candidate, reuse
-        # the nearest unmatched symbol so it is realigned instead of duplicated.
-        if match is None:
-            nearest_distance = None
-            for record in existing:
-                name, point, instance, owner_view_id, source_link_id, source_fixture_id = record
-                if id_value(instance.Id) in matched_existing_ids \
-                        or source_fixture_id is not None \
-                        or not same(name, target_name):
-                    continue
-                if view_based:
-                    owner_view = plan_view_for_level(
-                        owner_view_id, item.target_level
-                    )
-                    if owner_view is None:
-                        continue
-                elif not same_floor(instance, destination, item):
-                    continue
-                # plan distance: a symbol at the WRONG HEIGHT is still found
-                # (and then corrected) instead of being duplicated
-                distance = point_distance(point, destination, True)
-                if nearest_distance is None or distance < nearest_distance:
-                    nearest_distance = distance
-                    match = record
-                    if view_based:
-                        item.target_view = owner_view
-
-        if match is not None:
-            name, point, instance = match[0], match[1], match[2]
-            matched_existing_ids.add(id_value(instance.Id))
-            alignment_error = point_distance(point, destination, view_based)   # 3D for model families
-            instance_location = instance.Location
-            rotation_error = (
-                abs(rotation_difference(
-                    item.rotation, instance_location.Rotation
-                ))
-                if rotate and isinstance(instance_location, LocationPoint)
-                else 0.0
-            )
-            item.existing_instance = instance
-            item.existing_id = instance.Id
-            item.status = (
-                "existing"
-                if same(name, target_name)
-                and alignment_error <= ALIGN_TOLERANCE
-                and rotation_error <= ROTATION_TOLERANCE
-                else "update"
-            )
+pairs = []
+for item in eligible:
+    if item.existing_id is not None:
+        continue
+    cx, cy = int(math.floor(item.point.X / cell)), int(math.floor(item.point.Y / cell))
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for record in grid.get((cx + dx, cy + dy), []):
+                distance = point_distance(record[0], item.point, True)
+                if distance <= EXISTING_RADIUS and on_item_floor(record, item):
+                    pairs.append((distance, item, record))
+pairs.sort(key=lambda pair: pair[0])
+for distance, item, record in pairs:
+    instance_id = id_value(record[1].Id)
+    if item.existing_id is not None or instance_id in used_existing:
+        continue
+    item.existing_instance, item.existing_id = record[1], record[1].Id
+    item.existing_distance = distance
+    item.status = "existing"
+    used_existing.add(instance_id)
 
 to_place = [i for i in items if i.status == "place"]
 already = [i for i in items if i.status == "existing"]
-updates = [i for i in items if i.status == "update"]
 outside = [i for i in items if i.status == "outside"]
 no_view = [i for i in items if i.status == "no_view"]
 no_location = [i for i in items if i.status in ("noloc", "no_level")]
@@ -1008,7 +952,7 @@ for key in group_keys:
         "match": u"existing ({}%)".format(best_symbol(family_symbols, key)[1]) if kind == "existing" else u"NEW type",
         "watts": watt_summary(key),
         "new": len([i for i in key_items if i.status == "place"]),
-        "update": len([i for i in key_items if i.status == "update"]),
+        "existing": len([i for i in key_items if i.status == "existing"]),
     })
 
 
@@ -1068,7 +1012,6 @@ STATUS_COLORS = {
     "new_type": Color.FromRgb(245, 158, 11),     # amber  - will be placed with a NEW type
     "existing_type": Color.FromRgb(34, 211, 238),  # cyan - will be placed with your type
     "existing": Color.FromRgb(100, 116, 139),     # grey  - already placed earlier
-    "update": Color.FromRgb(139, 92, 246),        # violet - existing symbol will change type
     "outside": Color.FromRgb(239, 68, 68),        # red   - not selected or no plan view
 }
 
@@ -1076,8 +1019,6 @@ STATUS_COLORS = {
 def item_color_key(item):
     if item.status == "existing":
         return "existing"
-    if item.status == "update":
-        return "update"
     if item.status in ("outside", "noloc", "no_level", "no_host_level", "no_view"):
         return "outside"
     return "existing_type" if mapping[item.key][0] == "existing" else "new_type"
@@ -1087,7 +1028,6 @@ class PreviewWindow(object):
     def __init__(self):
         self.accepted = False
         self.copy_watts = True
-        self.update_existing = bool(updates)
         self.center = Point3D(0, 0, 0)
         self.radius = 10.0
         self.preset = "top"
@@ -1113,9 +1053,9 @@ class PreviewWindow(object):
         header.Background = brush("#1E3A8A")
         header.Children.Add(text_block("LIGHT PLACEMENT 2D", 20, True, "#FFFFFF", Thickness(18, 12, 18, 0)))
         header.Children.Add(text_block(
-            u"Link: {}   |   2D family: {}   |   {} fixture(s): {} to place, {} already placed{}".format(
-                linked_doc.Title, family.Name, len(selected_items), len(to_place), len(already),
-                u", {} to update".format(len(updates)) if updates else u""),
+            u"Link: {}   |   2D family: {}   |   {} fixture(s): {} NEW to place, {} already have a "
+            u"symbol within 350 mm (left untouched)".format(
+                linked_doc.Title, family.Name, len(selected_items), len(to_place), len(already)),
             12, False, "#DBEAFE", Thickness(18, 0, 18, 12)))
         DockPanel.SetDock(header, Dock.Top)
         root.Children.Add(header)
@@ -1132,28 +1072,17 @@ class PreviewWindow(object):
         self.watt_box.IsEnabled = bool(with_watts)
         self.watt_box.VerticalAlignment = VerticalAlignment.Center
         self.watt_box.Margin = Thickness(0, 0, 12, 0)
-        self.update_box = CheckBox()
-        self.update_box.Content = "Realign / update existing symbols"
-        self.update_box.IsChecked = bool(updates)
-        self.update_box.IsEnabled = bool(updates)
-        self.update_box.VerticalAlignment = VerticalAlignment.Center
-        self.update_box.Margin = Thickness(0, 0, 12, 0)
         cancel = make_button("Cancel", False)
         cancel.IsCancel = True
         cancel.Click += lambda sender, args: window.Close()
         place = make_button(
-            u"Place {} symbol(s)".format(len(to_place))
-            if to_place else
-            (u"Update existing symbol(s)" if updates else "Update wattage only"),
+            u"Place {} new symbol(s)".format(len(to_place)) if to_place else u"Nothing new to place",
             True
         )
-        place.IsEnabled = bool(to_place) or bool(updates) or bool(already and with_watts)
+        place.IsEnabled = bool(to_place)
         self.place_button = place
-        self.update_box.Checked += self.on_update_option_changed
-        self.update_box.Unchecked += self.on_update_option_changed
         place.Click += self.on_place
         buttons.Children.Add(self.watt_box)
-        buttons.Children.Add(self.update_box)
         buttons.Children.Add(cancel)
         buttons.Children.Add(place)
         DockPanel.SetDock(buttons, Dock.Right)
@@ -1190,7 +1119,7 @@ class PreviewWindow(object):
         legend = StackPanel()
         legend.Orientation = Orientation.Horizontal
         for key, label in (("existing_type", "Your existing type"), ("new_type", "New type"),
-                           ("update", "Different existing type"), ("existing", "Already placed"),
+                           ("existing", "Existing within 350 mm (untouched)"),
                            ("outside", "Cannot place / missing level")):
             swatch = Border()
             swatch.Width = 12
@@ -1302,16 +1231,16 @@ class PreviewWindow(object):
     def build_matching(self):
         grid = WpfGrid()
         grid.Margin = Thickness(10)
-        widths = (2.2, 0.4, 1.8, 0.8, 1.0, 0.55, 0.65)
+        widths = (2.2, 0.4, 1.8, 0.8, 1.0, 0.55, 0.65)   # last column: existing
         for width in widths:
             column = ColumnDefinition()
             column.Width = GridLength(width, GridUnitType.Star)
             grid.ColumnDefinitions.Add(column)
         headers = ("Linked fixture (Family : Type)", "Qty", "Placed as 2D type",
-                   "Match", "Wattage (link)", "To place", "To update")
+                   "Match", "Wattage (link)", "New", "Existing")
         all_rows = [headers] + [(r["linked"], str(r["qty"]), r["target"],
                                  r["match"], r["watts"], str(r["new"]),
-                                 str(r["update"]))
+                                 str(r["existing"]))
                                 for r in rows]
         for row_index, values in enumerate(all_rows):
             definition = RowDefinition()
@@ -1345,22 +1274,13 @@ class PreviewWindow(object):
             u"{} linked lighting fixture(s) in {} type(s).".format(
                 len(selected_items), len(rows)),
             u"{} will be placed now.".format(len(to_place)),
-            u"{} symbols already match the type and location.".format(len(already)),
+            u"{} already have a symbol within 350 mm - they are NOT changed "
+            u"(no move, no type change, no parameters, no circuit / wire changes).".format(len(already)),
             u"{} use your existing types, {} new type(s) will be created.".format(
                 sum(1 for k in selected_group_keys if mapping[k][0] == "existing"),
                 sum(1 for k in selected_group_keys if mapping[k][0] == "new")),
         ]
-        lines.append(u"{} existing symbol(s) can be realigned and/or changed to the matched type "
-                     u"(includes symbols at the wrong elevation).".format(len(updates)))
-        if not view_based:
-            lines.append(u"Model symbols are set to the linked fixture's exact elevation; the real height is "
-                         u"measured after placing and corrected (within 1 mm).")
-        if not view_based and id_value(family.FamilyCategory.Id) == int(
-                BuiltInCategory.OST_LightingFixtures):
-            lines.append(
-                u"Matched fixtures' circuits will be reset to automatic All Devices wire paths. "
-                u"Circuit membership and panel assignment are preserved; manual wire paths are replaced."
-            )
+        lines.append(u"Only NEW symbols are added; existing wiring and circuits are not touched.")
         if outside:
             lines.append(u"{} skipped: outside the selected levels.".format(len(outside)))
         if no_view:
@@ -1389,21 +1309,7 @@ class PreviewWindow(object):
     def on_place(self, sender, args):
         self.accepted = True
         self.copy_watts = self.watt_box.IsChecked == True
-        self.update_existing = self.update_box.IsChecked == True
         self.window.Close()
-
-    def on_update_option_changed(self, sender, args):
-        self.place_button.IsEnabled = (
-            bool(to_place)
-            or (bool(updates) and self.update_box.IsChecked == True)
-            or bool(already and with_watts)
-        )
-        if to_place:
-            self.place_button.Content = u"Place {} symbol(s)".format(len(to_place))
-        elif updates and self.update_box.IsChecked == True:
-            self.place_button.Content = "Update existing symbol(s)"
-        else:
-            self.place_button.Content = "Update wattage only"
 
     def show(self):
         self.window.ShowDialog()
@@ -1414,22 +1320,18 @@ preview = PreviewWindow()
 if not preview.show():
     script.exit()
 copy_watts = preview.copy_watts
-to_update = updates if preview.update_existing else []
 
 
 # -----------------------------------------------------------------------------
 # 8. Place + copy wattage (one transaction)
 # -----------------------------------------------------------------------------
 placed = 0
-updated = 0
 watt_written = 0
 watt_missing_target = 0
 created_types = []
 failed = []
 placed_per_type = {}
 type_watts = {}        # type-level wattage: symbol id -> set of values written
-affected_circuit_ids = set()
-routed_circuits = 0
 
 
 def apply_watts(instance, item):
@@ -1462,13 +1364,6 @@ def write_source_comments(instance, item):
         ))
 
 
-def connected_circuit_ids(instance):
-    mep_model = instance.MEPModel
-    if mep_model is None:
-        return set()
-    return set(id_value(system.Id) for system in mep_model.GetElectricalSystems())
-
-
 transaction = Transaction(doc, "Place 2D lighting symbols from link")
 handling = transaction.GetFailureHandlingOptions()
 handling.SetFailuresPreprocessor(WarningSwallower())
@@ -1480,7 +1375,7 @@ try:
     for key in group_keys:
         if not any(i.key == key and (
                 i.status == "place" or
-                (preview.update_existing and i.status == "update")
+                False
         ) for i in items):
             continue        # nothing new to place for this type
         kind, value = mapping[key]
@@ -1499,57 +1394,6 @@ try:
         if not symbol.IsActive:
             symbol.Activate()
     doc.Regenerate()
-
-    # refresh wattage on symbols placed in an earlier run
-    for item in already:
-        instance = doc.GetElement(item.existing_id)
-        if instance is not None:
-            try:
-                affected_circuit_ids.update(connected_circuit_ids(instance))
-                apply_watts(instance, item)
-            except Exception as error:
-                failed.append([u"{} : {}".format(*item.key), id_value(item.fixture.Id),
-                               u"circuit lookup / wattage: {}".format(error)])
-
-    for item in to_update:
-        symbol = symbol_for.get(item.key)
-        source_label = u"{} : {}".format(*item.key)
-        if symbol is None:
-            failed.append([source_label, id_value(item.fixture.Id), "No 2D type available for update"])
-            continue
-        sub = SubTransaction(doc)
-        sub.Start()
-        try:
-            instance = doc.GetElement(item.existing_id)
-            if instance is None:
-                raise Exception("Existing symbol instance was not found.")
-            previous_circuit_ids = connected_circuit_ids(instance)
-            changed_id = instance.ChangeTypeId(symbol.Id)
-            if changed_id is not None and changed_id != ElementId.InvalidElementId:
-                instance = doc.GetElement(changed_id) or instance
-            else:
-                instance = doc.GetElement(item.existing_id) or instance
-            if connected_circuit_ids(instance) != previous_circuit_ids:
-                raise Exception(
-                    "Changing this fixture would change its circuit membership; "
-                    "the update was rolled back."
-                )
-            align_instance(instance, item, view_based)
-            if connected_circuit_ids(instance) != previous_circuit_ids:
-                raise Exception(
-                    "Moving this fixture changed its circuit membership; "
-                    "the update was rolled back."
-                )
-            write_source_comments(instance, item)
-            apply_watts(instance, item)
-            sub.Commit()
-            affected_circuit_ids.update(previous_circuit_ids)
-            updated += 1
-            label = type_name(symbol)
-            placed_per_type[label] = placed_per_type.get(label, 0) + 1
-        except Exception as error:
-            sub.RollBack()
-            failed.append([source_label, id_value(item.fixture.Id), u"update: {}".format(error)])
 
     for item in to_place:
         symbol = symbol_for.get(item.key)
@@ -1586,26 +1430,7 @@ try:
             sub.RollBack()
             failed.append([source_label, id_value(item.fixture.Id), str(error)])
 
-    if affected_circuit_ids:
-        found_circuit_ids = set()
-        for circuit in FilteredElementCollector(doc).OfClass(ElectricalSystem):
-            circuit_id = id_value(circuit.Id)
-            if circuit_id not in affected_circuit_ids:
-                continue
-            circuit.CircuitPathMode = ElectricalCircuitPathMode.AllDevices
-            found_circuit_ids.add(circuit_id)
-            routed_circuits += 1
-        missing_circuits = affected_circuit_ids - found_circuit_ids
-        if missing_circuits:
-            raise Exception(
-                "Could not find affected electrical circuit(s): {}".format(
-                    u", ".join(str(circuit_id) for circuit_id in sorted(missing_circuits))
-                )
-            )
-        doc.Regenerate()
-
-    if placed == 0 and updated == 0 and routed_circuits == 0 \
-            and not created_types and watt_written == 0:
+    if placed == 0 and not created_types:
         transaction.RollBack()
     else:
         transaction.Commit()
@@ -1626,7 +1451,13 @@ output.print_table(table_data=[[r["linked"], r["qty"], r["target"], r["match"], 
                    title="Type matching")
 if placed_per_type:
     output.print_table(table_data=[[n, c] for n, c in sorted(placed_per_type.items())],
-                       columns=["2D type", "Placed / updated"], title="Placed per type")
+                       columns=["2D type", "Placed"], title="New symbols placed per type")
+if already:
+    output.print_table(
+        table_data=[[u"{} : {}".format(*i.key), id_value(i.fixture.Id), output.linkify(i.existing_id),
+                     int(round(getattr(i, "existing_distance", 0.0) * 304.8))] for i in already][:500],
+        columns=["Linked type", "Linked ID", "Existing symbol (click)", "Distance (mm)"],
+        title=u"Already existing within 350 mm - untouched ({})".format(len(already)))
 if created_types:
     output.print_table(table_data=[[n] for n in created_types], columns=["New type"], title="New types created")
 if conflicts:
@@ -1642,18 +1473,10 @@ if elevation_problems:
 
 summary = [
     u"{} symbol(s) placed.".format(placed),
-    u"{} existing symbol(s) realigned and/or updated to the matched type.".format(updated),
     u"{} new type(s) created.".format(len(created_types)),
-    u"{} already placed earlier (skipped).".format(len(already)),
+    u"{} already had a symbol within 350 mm - left untouched.".format(len(already)),
+    u"Existing fixtures, wiring and circuits were NOT changed.",
 ]
-if routed_circuits:
-    summary.append(
-        u"{} affected circuit(s) reset to automatic All Devices wire paths; "
-        u"membership and panel assignment were not changed.".format(routed_circuits)
-    )
-elif not view_based and id_value(family.FamilyCategory.Id) == int(
-        BuiltInCategory.OST_LightingFixtures):
-    summary.append("No connected circuits were found on the matched fixtures; no wire paths were recalculated.")
 if outside:
     summary.append(u"{} skipped: outside the selected levels.".format(len(outside)))
 if no_view:
@@ -1676,8 +1499,8 @@ if not view_based:
     if elevation_problems:
         summary.append(u"{} symbol(s) could NOT be set to the linked elevation - see the output window."
                        .format(len(elevation_problems)))
-    elif placed or updated:
-        summary.append(u"Elevation checked: every placed / updated symbol is at the linked fixture's "
+    elif placed:
+        summary.append(u"Elevation checked: every NEW symbol is at the linked fixture's "
                        u"elevation (within 1 mm).")
 if failed:
     summary.append(u"{} problem(s) - see the output window.".format(len(failed)))
