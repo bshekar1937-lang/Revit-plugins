@@ -82,6 +82,11 @@ active_view = doc.ActiveView
 output = script.get_output()
 config = script.get_config()
 choose_again = EXEC_PARAMS.config_mode   # True on Shift+Click
+# elements selected in Revit before running (checked for deletion, with a reason each)
+try:
+    preselected_element_ids = list(uidoc.Selection.GetElementIds())
+except Exception:
+    preselected_element_ids = []
 
 DUPLICATE_TOLERANCE = 50.0 / 304.8          # 50 mm in feet
 ALIGN_TOLERANCE = 1.0 / 304.8               # 1 mm in feet
@@ -988,18 +993,44 @@ linked_grid = {}
 for item in items:
     if item.point is not None:
         linked_grid.setdefault((int(math.floor(item.point.X / EXISTING_RADIUS)),
-                                int(math.floor(item.point.Y / EXISTING_RADIUS))), []).append(item.point)
+                                int(math.floor(item.point.Y / EXISTING_RADIUS))), []).append(item)
+
+
+def nearest_linked(point, ignore_height):
+    """(linked item, plan distance) of the closest linked fixture within 350 mm, else (None, None)."""
+    cx, cy = int(math.floor(point.X / EXISTING_RADIUS)), int(math.floor(point.Y / EXISTING_RADIUS))
+    best, best_distance = None, None
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for item in linked_grid.get((cx + dx, cy + dy), []):
+                distance = point_distance(point, item.point, True)
+                if distance <= EXISTING_RADIUS and \
+                        (ignore_height or abs(point.Z - item.point.Z) < 1500.0 / 304.8) and \
+                        (best is None or distance < best_distance):
+                    best, best_distance = item, distance
+    return best, best_distance
 
 
 def near_any_linked(point, ignore_height):
-    cx, cy = int(math.floor(point.X / EXISTING_RADIUS)), int(math.floor(point.Y / EXISTING_RADIUS))
-    for dx in (-1, 0, 1):
-        for dy in (-1, 0, 1):
-            for linked_point in linked_grid.get((cx + dx, cy + dy), []):
-                if point_distance(point, linked_point, True) <= EXISTING_RADIUS and \
-                        (ignore_height or abs(point.Z - linked_point.Z) < 1500.0 / 304.8):
-                    return True
-    return False
+    return nearest_linked(point, ignore_height)[0] is not None
+
+
+matched_by = dict((id_value(i.existing_id), i) for i in items if i.existing_id is not None)
+preselected = set(id_value(i) for i in preselected_element_ids)
+
+# candidates: chosen 2D family + host lighting fixtures, plus anything the user selected
+candidate_records = list(existing)
+known = set(id_value(r[1].Id) for r in existing)
+for element_id in preselected_element_ids:
+    if id_value(element_id) in known:
+        continue
+    element = doc.GetElement(element_id)
+    if isinstance(element, FamilyInstance) and isinstance(element.Location, LocationPoint):
+        try:
+            owner_view_id = element.OwnerViewId
+        except Exception:
+            owner_view_id = None
+        candidate_records.append((element.Location.Point, element, owner_view_id, None, None))
 
 
 class Orphan(object):
@@ -1010,30 +1041,69 @@ class Orphan(object):
         symbol = record[1].Symbol
         self.label = u"{} : {}".format(symbol.FamilyName, type_name(symbol))
         self.in_family = symbol.Family is not None and symbol.Family.Id == family.Id
+        self.selected = id_value(record[1].Id) in preselected
         self.circuits = connected_circuit_ids(record[1])
+        try:
+            self.category = record[1].Category.Name
+        except Exception:
+            self.category = u"-"
 
 
 orphans = []
+selection_report = []     # [element id, family : type, category, reason] for the user's selection
 level_names = dict((id_value(level.Id), level.Name) for level in levels)
-for record in existing:
+for record in candidate_records:
+    instance = record[1]
+    instance_id = id_value(instance.Id)
+    is_selected = instance_id in preselected
     try:
-        if id_value(record[1].Id) in used_existing:
-            continue
-        level_id = record_level_id(record)
-        if level_id not in selected_host_level_ids:
-            continue
-        if near_any_linked(record[0], is_view_specific(record[1])):
-            continue
-        orphan = Orphan(record)
-        orphan.level_name = level_names.get(level_id, u"-")
-        orphans.append(orphan)
-    except Exception:
-        continue
+        symbol = instance.Symbol
+        label = u"{} : {}".format(symbol.FamilyName, type_name(symbol))
+        category = instance.Category.Name if instance.Category else u"-"
+        reason = None
+        if instance_id in matched_by:
+            item = matched_by[instance_id]
+            reason = u"KEPT - it is the symbol of linked fixture ID {} ({})".format(
+                id_value(item.fixture.Id), u"aligned" if item.status == "align" else u"already on it")
+        else:
+            level_id = record_level_id(record)
+            if level_id not in selected_host_level_ids:
+                reason = u"KEPT - its level ({}) is not one of the selected levels".format(
+                    level_names.get(level_id, u"unknown"))
+            else:
+                item, distance = nearest_linked(record[0], is_view_specific(instance))
+                if item is not None:
+                    reason = u"KEPT - linked fixture ID {} is {} mm away (within 350 mm)".format(
+                        id_value(item.fixture.Id), int(round(distance * 304.8)))
+                else:
+                    orphan = Orphan(record)
+                    orphan.level_name = level_names.get(level_id, u"-")
+                    orphans.append(orphan)
+                    notes = []
+                    if orphan.circuits:
+                        notes.append(u"on {} circuit(s): deleted only if 'Keep fixtures connected to a "
+                                     u"circuit' is UNTICKED".format(len(orphan.circuits)))
+                    reason = u"NO linked fixture - will be deleted when 'Delete' is ticked" + \
+                             (u" ({})".format(u"; ".join(notes)) if notes else u"")
+        if is_selected:
+            selection_report.append([str(instance_id), label, category, reason])
+    except Exception as error:
+        if is_selected:
+            selection_report.append([str(instance_id), u"-", u"-", u"could not be checked: {}".format(error)])
+
+for element_id in preselected_element_ids:
+    if id_value(element_id) not in set(int(r[0]) for r in selection_report):
+        element = doc.GetElement(element_id)
+        name = element.Name if element is not None else u"-"
+        category = element.Category.Name if element is not None and element.Category else u"-"
+        selection_report.append([str(id_value(element_id)), name, category,
+                                 u"KEPT - not a point-based family instance (wire, tag, line ...)"])
 
 
 def orphans_to_delete(include_other, keep_circuited):
+    """Selected elements are always allowed (you picked them); circuited ones obey the option."""
     return [o for o in orphans
-            if (o.in_family or include_other) and not (keep_circuited and o.circuits)]
+            if (o.in_family or include_other or o.selected) and not (keep_circuited and o.circuits)]
 outside = [i for i in items if i.status == "outside"]
 no_view = [i for i in items if i.status == "no_view"]
 no_location = [i for i in items if i.status in ("noloc", "no_level")]
@@ -1475,8 +1545,17 @@ class PreviewWindow(object):
         align = bool(to_align) and self.align_box.IsChecked == True
         to_delete = self.deletion_list()
         candidates = orphans_to_delete(self.other_box.IsChecked == True, self.circuit_box.IsChecked == True)
-        self.orphan_count.Text = u"{} symbol(s) {} deleted with these settings.".format(
-            len(candidates), u"WILL BE" if self.delete_box.IsChecked == True else u"would be")
+        include_other = self.other_box.IsChecked == True
+        keep_circuited = self.circuit_box.IsChecked == True
+        kept_family = len([o for o in orphans if not (o.in_family or include_other or o.selected)])
+        kept_circuit = len([o for o in orphans if (o.in_family or include_other or o.selected)
+                            and keep_circuited and o.circuits])
+        self.orphan_count.Text = (
+            u"{} found with no linked fixture: {} {} deleted, {} kept because they are on a circuit, "
+            u"{} kept because they are another family.".format(
+                len(orphans), len(candidates),
+                u"WILL BE" if self.delete_box.IsChecked == True else u"would be",
+                kept_circuit, kept_family))
         parts = []
         if to_place:
             parts.append(u"Place {} new".format(len(to_place)))
@@ -1494,6 +1573,33 @@ class PreviewWindow(object):
         self.delete_ids = [o.id for o in self.deletion_list()]
         self.window.Close()
 
+    def simple_table(self, rows, widths, max_height):
+        grid = WpfGrid()
+        for width in widths:
+            column = ColumnDefinition()
+            column.Width = GridLength(width, GridUnitType.Star)
+            grid.ColumnDefinitions.Add(column)
+        for row_index, values in enumerate(rows):
+            definition = RowDefinition()
+            definition.Height = GridLength.Auto
+            grid.RowDefinitions.Add(definition)
+            for column_index, value in enumerate(values):
+                block = text_block(value, 12, row_index == 0, "#0F172A", Thickness(0, 2, 10, 2))
+                WpfGrid.SetRow(block, row_index)
+                WpfGrid.SetColumn(block, column_index)
+                grid.Children.Add(block)
+        scroll = ScrollViewer()
+        scroll.VerticalScrollBarVisibility = ScrollBarVisibility.Auto
+        scroll.MaxHeight = max_height
+        scroll.Content = grid
+        frame = Border()
+        frame.Background = Brushes.White
+        frame.CornerRadius = CornerRadius(8)
+        frame.Padding = Thickness(8)
+        frame.Margin = Thickness(0, 0, 0, 8)
+        frame.Child = scroll
+        return frame
+
     def build_orphans(self):
         page = StackPanel()
         page.Margin = Thickness(12)
@@ -1505,6 +1611,22 @@ class PreviewWindow(object):
         page.Children.Add(self.other_box)
         page.Children.Add(self.circuit_box)
         page.Children.Add(self.orphan_count)
+        page.Children.Add(text_block(
+            u"Deleting a fixture that is on a circuit removes it from that circuit (its wires are "
+            u"disconnected). Untick 'Keep fixtures connected to a circuit' only when that is wanted.",
+            11, False, "#9A3412", Thickness(0, 0, 0, 8)))
+
+        if selection_report:
+            page.Children.Add(text_block(u"Elements you selected in Revit ({}) - why each is / is not deleted:"
+                                         .format(len(selection_report)), 12, True, "#0F172A", Thickness(0, 4, 0, 4)))
+            page.Children.Add(self.simple_table(
+                [("Element ID", "Family : Type", "Category", "Reason")] + [tuple(r) for r in selection_report],
+                (0.8, 2.0, 1.2, 4.0), 200))
+        else:
+            page.Children.Add(text_block(
+                u"Tip: select fixtures in Revit BEFORE running the tool - this tab then shows why each "
+                u"one is or is not deleted, and selected fixtures are added to the delete list.",
+                11, False, "#475569", Thickness(0, 4, 0, 8)))
 
         grid = WpfGrid()
         for width in (2.6, 0.9, 1.2, 1.2, 1.0):
@@ -1514,7 +1636,7 @@ class PreviewWindow(object):
         rows = [("Family : Type", "Element ID", "Level", "Source", "Circuit")]
         for o in orphans[:1000]:
             rows.append((o.label, str(id_value(o.id)), o.level_name,
-                         family.Name if o.in_family else u"other lighting fixture",
+                         family.Name if o.in_family else (u"selected" if o.selected else o.category),
                          u"connected" if o.circuits else u"-"))
         for row_index, values in enumerate(rows):
             definition = RowDefinition()
@@ -1724,6 +1846,9 @@ output.print_table(table_data=[[r["linked"], r["qty"], r["target"], r["match"], 
 if placed_per_type:
     output.print_table(table_data=[[n, c] for n, c in sorted(placed_per_type.items())],
                        columns=["2D type", "Placed"], title="New symbols placed per type")
+if selection_report:
+    output.print_table(table_data=selection_report, columns=["Element ID", "Family : Type", "Category", "Reason"],
+                       title=u"Your selected elements - delete check ({})".format(len(selection_report)))
 if deleted:
     output.print_table(table_data=deleted, columns=["Family : Type", "Deleted element ID", "Level"],
                        title=u"Deleted: existing symbols with no linked fixture ({})".format(len(deleted)))
