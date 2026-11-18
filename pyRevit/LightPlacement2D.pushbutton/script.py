@@ -24,6 +24,10 @@ __doc__ = (
 #                    fixture (moved only: no type change, no parameters; the
 #                    move is undone if it would change the element's circuit).
 #                    Only linked fixtures with no symbol nearby get a new one.
+#     * orphans    : existing symbols on the selected levels with NO linked
+#                    fixture within 350 mm can be deleted (tab "No linked
+#                    fixture"; off by default, only the chosen 2D family unless
+#                    widened, circuit-connected fixtures kept by default).
 #     * wattage    : read from each linked fixture (instance or type) and
 #                    written to the placed 2D symbol (same parameter name, or
 #                    Wattage / Power / Apparent Load ...), units converted
@@ -906,6 +910,16 @@ for distance, item, record in pairs:
     item.status = "existing"
     used_existing.add(instance_id)
 
+def connected_circuit_ids(instance):
+    """Ids of the electrical circuits the element belongs to (empty for 2D symbols)."""
+    try:
+        model = instance.MEPModel
+        systems = model.GetElectricalSystems() if model is not None else None
+        return set(id_value(system.Id) for system in systems) if systems else set()
+    except Exception:
+        return set()
+
+
 def is_view_specific(instance):
     try:
         owner = instance.OwnerViewId
@@ -939,6 +953,87 @@ for item in items:
 to_place = [i for i in items if i.status == "place"]
 already = [i for i in items if i.status == "existing"]
 to_align = [i for i in items if i.status == "align"]
+
+# -----------------------------------------------------------------------------
+# ORPHANS: existing symbols on the selected levels that have NO linked fixture.
+# Safety: a symbol is only an orphan when no linked fixture at all (any level,
+# any status) lies within 350 mm of it in plan on the same floor.
+# -----------------------------------------------------------------------------
+selected_host_level_ids = set(id_value(i.target_level.Id) for i in items
+                              if i.target_level is not None and i.level is not None
+                              and id_value(i.level.Id) in selected_level_ids)
+
+
+def record_level_id(record):
+    point, instance, owner_view_id = record[0], record[1], record[2]
+    if owner_view_id is not None and owner_view_id != ElementId.InvalidElementId:
+        try:
+            view = doc.GetElement(owner_view_id)
+            if isinstance(view, ViewPlan) and view.GenLevel is not None:
+                return id_value(view.GenLevel.Id)
+        except Exception:
+            pass
+        return None
+    try:
+        level_id = instance.LevelId
+        if level_id is not None and level_id != ElementId.InvalidElementId:
+            return id_value(level_id)
+    except Exception:
+        pass
+    level = level_for(point.Z, levels)
+    return id_value(level.Id) if level is not None else None
+
+
+linked_grid = {}
+for item in items:
+    if item.point is not None:
+        linked_grid.setdefault((int(math.floor(item.point.X / EXISTING_RADIUS)),
+                                int(math.floor(item.point.Y / EXISTING_RADIUS))), []).append(item.point)
+
+
+def near_any_linked(point, ignore_height):
+    cx, cy = int(math.floor(point.X / EXISTING_RADIUS)), int(math.floor(point.Y / EXISTING_RADIUS))
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for linked_point in linked_grid.get((cx + dx, cy + dy), []):
+                if point_distance(point, linked_point, True) <= EXISTING_RADIUS and \
+                        (ignore_height or abs(point.Z - linked_point.Z) < 1500.0 / 304.8):
+                    return True
+    return False
+
+
+class Orphan(object):
+    def __init__(self, record):
+        self.point = record[0]
+        self.instance = record[1]
+        self.id = record[1].Id
+        symbol = record[1].Symbol
+        self.label = u"{} : {}".format(symbol.FamilyName, type_name(symbol))
+        self.in_family = symbol.Family is not None and symbol.Family.Id == family.Id
+        self.circuits = connected_circuit_ids(record[1])
+
+
+orphans = []
+level_names = dict((id_value(level.Id), level.Name) for level in levels)
+for record in existing:
+    try:
+        if id_value(record[1].Id) in used_existing:
+            continue
+        level_id = record_level_id(record)
+        if level_id not in selected_host_level_ids:
+            continue
+        if near_any_linked(record[0], is_view_specific(record[1])):
+            continue
+        orphan = Orphan(record)
+        orphan.level_name = level_names.get(level_id, u"-")
+        orphans.append(orphan)
+    except Exception:
+        continue
+
+
+def orphans_to_delete(include_other, keep_circuited):
+    return [o for o in orphans
+            if (o.in_family or include_other) and not (keep_circuited and o.circuits)]
 outside = [i for i in items if i.status == "outside"]
 no_view = [i for i in items if i.status == "no_view"]
 no_location = [i for i in items if i.status in ("noloc", "no_level")]
@@ -1046,6 +1141,7 @@ STATUS_COLORS = {
     "existing_type": Color.FromRgb(34, 211, 238),  # cyan - will be placed with your type
     "existing": Color.FromRgb(100, 116, 139),     # grey  - existing, already aligned
     "align": Color.FromRgb(168, 85, 247),         # purple - existing within 350 mm, will be aligned
+    "orphan": Color.FromRgb(236, 72, 153),        # pink  - existing symbol with NO linked fixture
     "outside": Color.FromRgb(239, 68, 68),        # red   - not selected or no plan view
 }
 
@@ -1083,6 +1179,22 @@ class PreviewWindow(object):
         except Exception:
             pass
         self.window = window
+
+        # orphan deletion options (shown on the "No linked fixture" tab)
+        self.delete_box = CheckBox()
+        self.delete_box.Content = u"Delete existing symbols that have NO linked fixture"
+        self.delete_box.IsChecked = False          # destructive: off unless you tick it
+        self.other_box = CheckBox()
+        self.other_box.Content = u"Include other host lighting fixtures (not only '{}')".format(family.Name)
+        self.other_box.IsChecked = False
+        self.circuit_box = CheckBox()
+        self.circuit_box.Content = u"Keep fixtures that are connected to a circuit (protects wiring)"
+        self.circuit_box.IsChecked = True
+        for box in (self.delete_box, self.other_box, self.circuit_box):
+            box.Margin = Thickness(0, 4, 0, 4)
+            box.Checked += lambda sender, args: self.refresh_button()
+            box.Unchecked += lambda sender, args: self.refresh_button()
+        self.orphan_count = text_block(u"", 12, True, "#BE185D", Thickness(0, 6, 0, 6))
 
         root = DockPanel()
         header = StackPanel()
@@ -1142,6 +1254,7 @@ class PreviewWindow(object):
         tabs.Margin = Thickness(18, 12, 18, 0)
         tabs.Items.Add(self.tab("3D preview", self.build_preview()))
         tabs.Items.Add(self.tab(u"Type matching ({})".format(len(rows)), self.build_matching()))
+        tabs.Items.Add(self.tab(u"No linked fixture ({})".format(len(orphans)), self.build_orphans()))
         tabs.Items.Add(self.tab("Overview", self.build_overview()))
         root.Children.Add(tabs)
         window.Content = root
@@ -1162,6 +1275,7 @@ class PreviewWindow(object):
         legend.Orientation = Orientation.Horizontal
         for key, label in (("existing_type", "Your existing type"), ("new_type", "New type"),
                            ("align", "Existing - will be aligned"), ("existing", "Existing - already aligned"),
+                           ("orphan", "Existing - no linked fixture"),
                            ("outside", "Cannot place / missing level")):
             swatch = Border()
             swatch.Width = 12
@@ -1197,7 +1311,7 @@ class PreviewWindow(object):
         return page
 
     def build_scene(self):
-        points = [i.point for i in selected_items if i.point is not None]
+        points = [i.point for i in selected_items if i.point is not None] + [o.point for o in orphans]
         if not points:
             return
         min_x = min(p.X for p in points); max_x = max(p.X for p in points)
@@ -1211,6 +1325,8 @@ class PreviewWindow(object):
         for item in selected_items:
             if item.point is not None:
                 self.add_cube(meshes[item_color_key(item)], item.point, half)
+        for orphan in orphans:
+            self.add_cube(meshes["orphan"], orphan.point, half)
         scene = Model3DGroup()
         scene.Children.Add(AmbientLight(Color.FromRgb(170, 180, 200)))
         scene.Children.Add(DirectionalLight(Color.FromRgb(255, 255, 255), Vector3D(-1, -2, -3)))
@@ -1350,13 +1466,24 @@ class PreviewWindow(object):
         frame.Child = block
         return frame
 
+    def deletion_list(self):
+        if self.delete_box.IsChecked != True:
+            return []
+        return orphans_to_delete(self.other_box.IsChecked == True, self.circuit_box.IsChecked == True)
+
     def refresh_button(self):
         align = bool(to_align) and self.align_box.IsChecked == True
+        to_delete = self.deletion_list()
+        candidates = orphans_to_delete(self.other_box.IsChecked == True, self.circuit_box.IsChecked == True)
+        self.orphan_count.Text = u"{} symbol(s) {} deleted with these settings.".format(
+            len(candidates), u"WILL BE" if self.delete_box.IsChecked == True else u"would be")
         parts = []
         if to_place:
             parts.append(u"Place {} new".format(len(to_place)))
         if align:
             parts.append(u"Align {} existing".format(len(to_align)))
+        if to_delete:
+            parts.append(u"Delete {}".format(len(to_delete)))
         self.place_button.Content = u", ".join(parts) if parts else u"Nothing to do"
         self.place_button.IsEnabled = bool(parts)
 
@@ -1364,7 +1491,51 @@ class PreviewWindow(object):
         self.accepted = True
         self.copy_watts = self.watt_box.IsChecked == True
         self.align_existing = self.align_box.IsChecked == True
+        self.delete_ids = [o.id for o in self.deletion_list()]
         self.window.Close()
+
+    def build_orphans(self):
+        page = StackPanel()
+        page.Margin = Thickness(12)
+        page.Children.Add(text_block(
+            u"Existing symbols on the selected level(s) with NO linked lighting fixture within 350 mm "
+            u"(checked against every linked fixture, any level). Pink in the 3D preview.",
+            12, False, "#334155", Thickness(0, 0, 0, 6)))
+        page.Children.Add(self.delete_box)
+        page.Children.Add(self.other_box)
+        page.Children.Add(self.circuit_box)
+        page.Children.Add(self.orphan_count)
+
+        grid = WpfGrid()
+        for width in (2.6, 0.9, 1.2, 1.2, 1.0):
+            column = ColumnDefinition()
+            column.Width = GridLength(width, GridUnitType.Star)
+            grid.ColumnDefinitions.Add(column)
+        rows = [("Family : Type", "Element ID", "Level", "Source", "Circuit")]
+        for o in orphans[:1000]:
+            rows.append((o.label, str(id_value(o.id)), o.level_name,
+                         family.Name if o.in_family else u"other lighting fixture",
+                         u"connected" if o.circuits else u"-"))
+        for row_index, values in enumerate(rows):
+            definition = RowDefinition()
+            definition.Height = GridLength.Auto
+            grid.RowDefinitions.Add(definition)
+            for column_index, value in enumerate(values):
+                block = text_block(value, 12, row_index == 0, "#0F172A", Thickness(0, 2, 10, 2))
+                WpfGrid.SetRow(block, row_index)
+                WpfGrid.SetColumn(block, column_index)
+                grid.Children.Add(block)
+        scroll = ScrollViewer()
+        scroll.VerticalScrollBarVisibility = ScrollBarVisibility.Auto
+        scroll.MaxHeight = 360
+        scroll.Content = grid
+        frame = Border()
+        frame.Background = Brushes.White
+        frame.CornerRadius = CornerRadius(8)
+        frame.Padding = Thickness(8)
+        frame.Child = scroll
+        page.Children.Add(frame)
+        return page
 
     def show(self):
         self.window.ShowDialog()
@@ -1376,6 +1547,7 @@ if not preview.show():
     script.exit()
 copy_watts = preview.copy_watts
 align_existing = getattr(preview, "align_existing", False)
+delete_ids = getattr(preview, "delete_ids", [])
 
 
 # -----------------------------------------------------------------------------
@@ -1421,16 +1593,7 @@ def write_source_comments(instance, item):
 
 
 aligned = []          # [linked type, linked id, symbol link, moved in plan mm, moved in Z mm]
-
-
-def connected_circuit_ids(instance):
-    """Ids of the electrical circuits the element belongs to (empty for 2D symbols)."""
-    try:
-        model = instance.MEPModel
-        systems = model.GetElectricalSystems() if model is not None else None
-        return set(id_value(system.Id) for system in systems) if systems else set()
-    except Exception:
-        return set()
+deleted = []          # [family : type, element id, level]
 
 
 transaction = Transaction(doc, "Place / align 2D lighting symbols from link")
@@ -1489,6 +1652,21 @@ try:
             sub.RollBack()
             failed.append([source_label, id_value(item.fixture.Id), u"align: {}".format(error)])
 
+    # delete existing symbols that have no linked fixture (only if ticked in the preview)
+    orphan_by_id = dict((id_value(o.id), o) for o in orphans)
+    for element_id in delete_ids:
+        orphan = orphan_by_id.get(id_value(element_id))
+        sub = SubTransaction(doc)
+        sub.Start()
+        try:
+            doc.Delete(element_id)
+            sub.Commit()
+            deleted.append([orphan.label if orphan else u"-", id_value(element_id),
+                            orphan.level_name if orphan else u"-"])
+        except Exception as error:
+            sub.RollBack()
+            failed.append([orphan.label if orphan else u"-", id_value(element_id), u"delete: {}".format(error)])
+
     for item in to_place:
         symbol = symbol_for.get(item.key)
         source_label = u"{} : {}".format(*item.key)
@@ -1524,7 +1702,7 @@ try:
             sub.RollBack()
             failed.append([source_label, id_value(item.fixture.Id), str(error)])
 
-    if placed == 0 and not aligned and not created_types:
+    if placed == 0 and not aligned and not deleted and not created_types:
         transaction.RollBack()
     else:
         transaction.Commit()
@@ -1546,6 +1724,9 @@ output.print_table(table_data=[[r["linked"], r["qty"], r["target"], r["match"], 
 if placed_per_type:
     output.print_table(table_data=[[n, c] for n, c in sorted(placed_per_type.items())],
                        columns=["2D type", "Placed"], title="New symbols placed per type")
+if deleted:
+    output.print_table(table_data=deleted, columns=["Family : Type", "Deleted element ID", "Level"],
+                       title=u"Deleted: existing symbols with no linked fixture ({})".format(len(deleted)))
 if aligned:
     output.print_table(
         table_data=aligned[:500],
@@ -1570,6 +1751,7 @@ summary = [
     u"{} existing symbol(s) within 350 mm aligned to the linked fixture{}.".format(
         len(aligned), u"" if align_existing or not to_align else u" (aligning was switched off)"),
     u"{} existing symbol(s) were already on the linked fixture.".format(len(already)),
+    u"{} existing symbol(s) with no linked fixture deleted ({} found).".format(len(deleted), len(orphans)),
     u"Aligned symbols were only moved: type, parameters and circuits unchanged.",
 ]
 if outside:
