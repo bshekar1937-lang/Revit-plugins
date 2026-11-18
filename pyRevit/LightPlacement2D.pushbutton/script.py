@@ -1,45 +1,38 @@
 # -*- coding: utf-8 -*-
 __title__ = "LIGHT\nPLACEMENT 2D"
 __doc__ = (
-    "AUTOMATIC: places your 2D lighting symbols at every lighting fixture of the "
-    "linked model. You pick the link; the 2D family and the type for each "
-    "linked fixture are found automatically (types you already created are "
-    "reused, missing ones are created) and the linked WATTAGE is copied. A 3D "
-    "preview is shown before placing, and afterwards every linked TYPE is "
-    "checked against the 2D family types (name, wattage, count). Shift+Click to change the 2D family."
+    "Choose a lighting link, the levels to process and one 2D annotation "
+    "family. Existing matching types are reused and missing types are created "
+    "inside that family. A preview lets you place new symbols or update "
+    "existing symbols at matching locations."
 )
 
 # =============================================================================
-# LIGHT PLACEMENT 2D  -  fully automatic
-#   Click            -> runs with no questions:
-#     * link       : ASKED every time (list shows each link's fixture count;
-#                    the link used last time is at the top)
-#     * 2D family  : the family whose existing types match the linked fixture
-#                    types best (remembered for next time)
+# LIGHT PLACEMENT 2D
+#   Run              -> choose levels and one 2D symbol family:
+#     * link       : the loaded link that contains lighting fixtures
+#                    (the one used last time if there are several)
+#     * 2D family  : one family selected by the user
 #     * types      : each linked "Family : Type" is matched to the closest
 #                    existing type name (spaces, dashes, case and word order
-#                    ignored); no match -> a new type named after the linked type
-#     * position   : centre of each linked fixture, rotated to match it
-#     * existing   : 2D symbols placed earlier are paired with their linked
-#                    fixture (by the Comments ID, else the nearest one within
-#                    half the fixture size + 300 mm). If one is not at the
-#                    fixture CENTRE it is MOVED there; no duplicate is placed
+#                    ignored); no match -> a new type in the selected family
+#     * position   : linked fixture insertion point, transformed to host coords
+#     * updates    : optionally change a different symbol already at the target
+#                    position to the type matching the linked fixture
 #     * wattage    : read from each linked fixture (instance or type) and
 #                    written to the placed 2D symbol (same parameter name, or
 #                    Wattage / Power / Apparent Load ...), units converted
 #     * preview    : a window with a 3D preview, the type matching (with
 #                    wattage) and a summary - nothing changes until you press
 #                    "Place symbols"
-#     * type check : after placing, every linked fixture TYPE is checked against
-#                    the 2D family: type exists, same name, same wattage, and
-#                    as many 2D symbols as linked fixtures
-#   Shift+Click      -> choose the 2D family again (saved for next runs)
+#   Shift+Click      -> choose the link again if several are loaded
 #
 # The output window lists every linked type and the 2D type it was matched to.
 # One transaction: a single Ctrl+Z undoes everything.
-# Model families (2D lighting fixture families) are placed at each fixture's
-# height; view-specific families (detail items / generic annotations) are
-# placed in the ACTIVE PLAN VIEW.
+# Model families are placed at each fixture's EXACT elevation: after placing or
+# moving, the symbol's real height is measured and corrected (offset parameter,
+# then vertical move) to within 1 mm. View-specific families
+# are placed in a plan view assigned to each selected level.
 # Revit 2023 - 2027, pyRevit (IronPython engine).
 # =============================================================================
 
@@ -48,6 +41,7 @@ import math
 from Autodesk.Revit.DB import (
     BuiltInCategory,
     BuiltInParameter,
+    ElementId,
     Family,
     FamilyInstance,
     FamilyPlacementType,
@@ -70,6 +64,7 @@ from Autodesk.Revit.DB import (
     UnitUtils,
 )
 from Autodesk.Revit.DB.Structure import StructuralType
+from Autodesk.Revit.DB.Electrical import ElectricalCircuitPathMode, ElectricalSystem
 from pyrevit import EXEC_PARAMS, forms, script
 
 
@@ -81,6 +76,8 @@ config = script.get_config()
 choose_again = EXEC_PARAMS.config_mode   # True on Shift+Click
 
 DUPLICATE_TOLERANCE = 50.0 / 304.8          # 50 mm in feet
+ALIGN_TOLERANCE = 1.0 / 304.8               # 1 mm in feet
+ROTATION_TOLERANCE = math.radians(0.1)
 INVALID_NAME_CHARS = u"\\:{}[]|;<>?`~"
 TARGET_CATEGORIES = [
     BuiltInCategory.OST_LightingFixtures,
@@ -136,9 +133,122 @@ def level_for(z, levels):
     return below[-1] if below else levels[0]
 
 
-def is_near(a, b, plan_only):
+def fixture_level(fixture, link_doc, link_levels, source_z):
+    """Prefer the linked instance's assigned level; infer from elevation only
+    for families without a usable level association."""
+    level_ids = []
+    try:
+        level_ids.append(fixture.LevelId)
+    except Exception:
+        pass
+    for parameter_id in (
+            BuiltInParameter.FAMILY_LEVEL_PARAM,
+            BuiltInParameter.INSTANCE_REFERENCE_LEVEL_PARAM,
+            BuiltInParameter.INSTANCE_SCHEDULE_ONLY_LEVEL_PARAM):
+        try:
+            parameter = fixture.get_Parameter(parameter_id)
+            if parameter and parameter.StorageType == StorageType.ElementId:
+                level_ids.append(parameter.AsElementId())
+        except Exception:
+            pass
+
+    for level_id in level_ids:
+        if level_id is None or level_id == ElementId.InvalidElementId:
+            continue
+        try:
+            level = link_doc.GetElement(level_id)
+            if isinstance(level, Level):
+                return level
+        except Exception:
+            pass
+    return level_for(source_z, link_levels) if source_z is not None else None
+
+
+def host_level_for(link_level, link_transform, host_levels):
+    """Match a linked level by name, then by its transformed elevation."""
+    if link_level is None or not host_levels:
+        return None
+    host_elevation = link_transform.OfPoint(
+        XYZ(0.0, 0.0, link_level.Elevation)
+    ).Z
+    same_name = [level for level in host_levels
+                 if same(level.Name, link_level.Name)]
+    candidates = same_name or host_levels
+    return min(candidates, key=lambda level: abs(level.Elevation - host_elevation))
+
+
+def point_distance(a, b, plan_only):
     dz = 0.0 if plan_only else a.Z - b.Z
-    return math.sqrt((a.X - b.X) ** 2 + (a.Y - b.Y) ** 2 + dz ** 2) < DUPLICATE_TOLERANCE
+    return math.sqrt((a.X - b.X) ** 2 + (a.Y - b.Y) ** 2 + dz ** 2)
+
+
+def rotation_difference(target, current):
+    return math.atan2(math.sin(target - current), math.cos(target - current))
+
+
+def source_reference_from_comments(instance):
+    """Return (link instance id, linked fixture id) for symbols placed here."""
+    try:
+        parameter = instance.get_Parameter(
+            BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS
+        )
+        comments = parameter.AsString() if parameter else None
+    except Exception:
+        comments = None
+    if not comments or not comments.startswith(linked_doc.Title + " |"):
+        return None, None
+
+    fixture_match = re.search(r"\|\s*ID\s+(-?\d+)(?:\s*\||$)", comments)
+    if not fixture_match:
+        return None, None
+    link_match = re.search(r"\|\s*Link instance\s+(-?\d+)\s*\|", comments)
+    source_link_id = int(link_match.group(1)) if link_match else None
+    source_fixture_id = int(fixture_match.group(1))
+    return source_link_id, source_fixture_id
+
+
+def target_point(item, view_based):
+    if view_based and item.target_level is not None:
+        return XYZ(item.point.X, item.point.Y, item.target_level.Elevation)
+    return item.point
+
+
+def plan_view_for_level(view_id, level):
+    if view_id is None or view_id == ElementId.InvalidElementId or level is None:
+        return None
+    try:
+        view = doc.GetElement(view_id)
+        if isinstance(view, ViewPlan) and view.GenLevel is not None \
+                and view.GenLevel.Id == level.Id:
+            return view
+    except Exception:
+        pass
+    return None
+
+
+def align_instance(instance, item, view_based):
+    """Move and rotate an existing symbol to the linked fixture location."""
+    location = instance.Location
+    if not isinstance(location, LocationPoint):
+        raise Exception("Existing symbol has no point location.")
+
+    destination = target_point(item, view_based)
+    if point_distance(location.Point, destination, view_based) > ALIGN_TOLERANCE:
+        ElementTransformUtils.MoveElement(
+            doc, instance.Id, destination - location.Point
+        )
+        location = instance.Location
+
+    if rotate and abs(item.rotation) > 1e-6 and not is_face_hosted(instance):
+        rotation_delta = rotation_difference(item.rotation, location.Rotation)
+        if abs(rotation_delta) > ROTATION_TOLERANCE:
+            origin = location.Point
+            ElementTransformUtils.RotateElement(
+                doc, instance.Id,
+                Line.CreateBound(origin, origin + XYZ.BasisZ),
+                rotation_delta
+            )
+    check_elevation(instance, item)
 
 
 def placement_of(fixture, transform, use_centre):
@@ -164,13 +274,84 @@ def placement_of(fixture, transform, use_centre):
     return transform.OfPoint(source), rotation
 
 
-def set_offset(instance, offset):
-    for bip in (BuiltInParameter.INSTANCE_ELEVATION_PARAM,
-                BuiltInParameter.INSTANCE_FREE_HOST_OFFSET_PARAM):
+ELEVATION_TOLERANCE = 1.0 / 304.8           # 1 mm in feet
+OFFSET_PARAMETERS = (
+    BuiltInParameter.INSTANCE_ELEVATION_PARAM,        # Elevation from Level
+    BuiltInParameter.INSTANCE_FREE_HOST_OFFSET_PARAM,  # Offset from Host
+)
+elevation_problems = []    # [linked type, linked id, expected mm, actual mm]
+
+
+def instance_z(instance):
+    location = instance.Location
+    return location.Point.Z if isinstance(location, LocationPoint) else None
+
+
+def fix_elevation(instance, target_z):
+    """Make the symbol's REAL insertion point sit at target_z (host, internal
+    feet). Revit treats point Z differently per family type (level based,
+    work-plane based, unhosted), so the result is measured after
+    regeneration and corrected: first through the offset parameter, then by
+    moving the element vertically. Returns the remaining error in feet."""
+    doc.Regenerate()
+    current = instance_z(instance)
+    if current is None:
+        return None
+    error = target_z - current
+    if abs(error) <= ELEVATION_TOLERANCE:
+        return 0.0
+
+    # 1) adjust the offset parameter by the measured error
+    for bip in OFFSET_PARAMETERS:
         parameter = instance.get_Parameter(bip)
-        if parameter and not parameter.IsReadOnly and parameter.StorageType == StorageType.Double:
-            parameter.Set(offset)
-            return
+        if parameter is None or parameter.IsReadOnly or parameter.StorageType != StorageType.Double:
+            continue
+        try:
+            parameter.Set(parameter.AsDouble() + error)
+            doc.Regenerate()
+            current = instance_z(instance)
+            error = target_z - current
+            if abs(error) <= ELEVATION_TOLERANCE:
+                return 0.0
+        except Exception:
+            pass
+
+    # 2) move the element vertically by whatever is left
+    try:
+        ElementTransformUtils.MoveElement(doc, instance.Id, XYZ(0.0, 0.0, error))
+        doc.Regenerate()
+        current = instance_z(instance)
+        error = target_z - current
+    except Exception:
+        pass
+    return 0.0 if abs(error) <= ELEVATION_TOLERANCE else error
+
+
+def check_elevation(instance, item):
+    """Model families only: correct and record any elevation mismatch."""
+    if view_based:
+        return
+    remaining = fix_elevation(instance, item.point.Z)
+    if remaining:
+        actual = instance_z(instance)
+        elevation_problems.append([
+            u"{} : {}".format(*item.key), id_value(item.fixture.Id),
+            int(round(item.point.Z * 304.8)),
+            int(round(actual * 304.8)) if actual is not None else "-",
+        ])
+
+
+def same_floor(instance, point, item):
+    """Plan-distance matching must not pick a symbol on another floor."""
+    if view_based:
+        return True
+    try:
+        if item.target_level is not None and instance.LevelId == item.target_level.Id:
+            return True
+    except Exception:
+        pass
+    z = instance_z(instance)
+    return z is not None and abs(z - point.Z) < 1500.0 / 304.8
 
 
 def is_face_hosted(instance):
@@ -180,16 +361,16 @@ def is_face_hosted(instance):
         return False
 
 
-def place_in_model(link, transform, fixture, symbol, point, levels):
+def place_in_model(link, transform, fixture, symbol, point, levels,
+                   assigned_level=None):
     errors = []
-    level = level_for(point.Z, levels)
+    level = assigned_level or level_for(point.Z, levels)
 
     # a) unhosted / level-based / work-plane-based families
     if level and symbol.Family.FamilyPlacementType != FamilyPlacementType.OneLevelBasedHosted:
         try:
-            instance = doc.Create.NewFamilyInstance(point, symbol, level, StructuralType.NonStructural)
-            set_offset(instance, point.Z - level.Elevation)
-            return instance
+            # the real elevation is measured and corrected afterwards (fix_elevation)
+            return doc.Create.NewFamilyInstance(point, symbol, level, StructuralType.NonStructural)
         except Exception as error:
             errors.append(str(error))
 
@@ -214,8 +395,11 @@ def place_in_model(link, transform, fixture, symbol, point, levels):
         " / ".join(sorted(set(errors)))))
 
 
-def place_in_view(symbol, point):
-    return doc.Create.NewFamilyInstance(XYZ(point.X, point.Y, 0), symbol, active_view)
+def place_in_view(symbol, point, target_view, target_level):
+    elevation = target_level.Elevation if target_level is not None else point.Z
+    return doc.Create.NewFamilyInstance(
+        XYZ(point.X, point.Y, elevation), symbol, target_view
+    )
 
 
 class WarningSwallower(IFailuresPreprocessor):
@@ -310,7 +494,7 @@ def collect_groups(link_doc):
 
 
 # -----------------------------------------------------------------------------
-# 1. Link (ALWAYS asked - every loaded link with its lighting fixture count)
+# 1. Link (automatic)
 # -----------------------------------------------------------------------------
 candidates = []
 for link_instance in FilteredElementCollector(doc).OfClass(RevitLinkInstance):
@@ -320,44 +504,41 @@ for link_instance in FilteredElementCollector(doc).OfClass(RevitLinkInstance):
         link_doc = None
     if link_doc is None:
         continue
-    candidates.append((link_instance, link_doc, collect_groups(link_doc)))
+    found = collect_groups(link_doc)
+    if found:
+        candidates.append((link_instance, link_doc, found))
 if not candidates:
-    forms.alert("No loaded Revit links were found.\n"
+    forms.alert("No loaded Revit link contains lighting fixtures.\n"
                 "Load the lighting link first (Manage > Manage Links).", exitscript=True)
 
 
-def fixture_count(item):
-    return sum(len(v) for v in item[2].values())
-
-
 def link_label(item):
-    count = fixture_count(item)
-    types = len(item[2])
-    return u"{}   ({}) - {} lighting fixture(s), {} type(s)".format(
-        item[1].Title, item[0].Name, count, types) if count else u"{}   ({}) - no lighting fixtures".format(
-        item[1].Title, item[0].Name)
+    return u"{}   ({} fixtures)".format(item[1].Title, sum(len(v) for v in item[2].values()))
 
 
-remembered = getattr(config, "link_title", None)
-# last used link first, then links with the most fixtures
-candidates.sort(key=lambda c: (c[1].Title != remembered, -fixture_count(c), c[1].Title.lower()))
-picked = forms.SelectFromList.show(
-    [Option(link_label(c), c) for c in candidates], name_attr="name",
-    title="1. Copy lighting fixtures FROM which linked model?",
-    button_name="Use this link")
-if not picked:
-    script.exit()
-link, linked_doc, groups = picked.value
-if not groups:
-    forms.alert(u"'{}' has no lighting fixtures. Run again and pick another link.".format(linked_doc.Title),
-                exitscript=True)
+chosen = None
+if len(candidates) == 1:
+    chosen = candidates[0]
+else:
+    remembered = getattr(config, "link_title", None)
+    if remembered and not choose_again:
+        chosen = next((c for c in candidates if c[1].Title == remembered), None)
+    if chosen is None:
+        picked = forms.SelectFromList.show(
+            [Option(link_label(c), c) for c in candidates], name_attr="name",
+            title="Several links have lighting fixtures - pick one (remembered next time)",
+            button_name="Use this link")
+        if not picked:
+            script.exit()
+        chosen = picked.value
+link, linked_doc, groups = chosen
 transform = link.GetTotalTransform()
 config.link_title = linked_doc.Title
 group_keys = sorted(groups.keys(), key=lambda k: (k[0].lower(), k[1].lower()))
 
 
 # -----------------------------------------------------------------------------
-# 2. 2D family (automatic: best name match, remembered)
+# 2. 2D family (chosen by the user; new types stay in this family)
 # -----------------------------------------------------------------------------
 category_ids = set(int(c) for c in TARGET_CATEGORIES)
 families = []
@@ -374,7 +555,7 @@ for family in FilteredElementCollector(doc).OfClass(Family):
         families.append((family, symbols, category.Name))
 if not families:
     forms.alert("No Lighting Fixture, Detail Item or Generic Annotation families are loaded.\n"
-                "Load your 2D family first (Insert > Load Family).", exitscript=True)
+                "Load your family first (Insert > Load Family).", exitscript=True)
 
 linked_family_names = set(norm(k[0]) for k in group_keys)
 
@@ -388,32 +569,18 @@ def family_fit(item):
     return matched + bonus
 
 
-chosen_family = None
-remembered = getattr(config, "family_name", None)
-if remembered and not choose_again:
-    chosen_family = next((f for f in families if f[0].Name == remembered), None)
-if chosen_family is None and not choose_again:
-    ranked = sorted(families, key=family_fit, reverse=True)
-    if family_fit(ranked[0]) >= 1:
-        chosen_family = ranked[0]
-if chosen_family is None:
-    ranked = sorted(families, key=family_fit, reverse=True)
-    picked = forms.SelectFromList.show(
-        [Option(u"{}:  {}".format(f[2], f[0].Name), f) for f in ranked], name_attr="name",
-        title="Pick your 2D symbol family ONCE (remembered; Shift+Click to change)",
-        button_name="Use this family")
-    if not picked:
-        script.exit()
-    chosen_family = picked.value
+ranked = sorted(families, key=family_fit, reverse=True)
+picked = forms.SelectFromList.show(
+    [Option(u"{}:  {}".format(f[2], f[0].Name), f) for f in ranked],
+    name_attr="name",
+    title="Choose ONE family. Missing linked types will be created in this family.",
+    button_name="Use this family")
+if not picked:
+    script.exit()
+chosen_family = picked.value
 family, family_symbols, _ = chosen_family
-config.family_name = family.Name
-script.save_config()
 
 view_based = family.FamilyPlacementType == FamilyPlacementType.ViewBased
-if view_based and not isinstance(active_view, ViewPlan):
-    forms.alert("'{}' is a view-specific family (detail item / annotation).\n\n"
-                "Open a floor or ceiling plan view first, then run the tool again.".format(family.Name),
-                exitscript=True)
 base_symbol = family_symbols[0]
 
 
@@ -444,11 +611,10 @@ for key in group_keys:
 # -----------------------------------------------------------------------------
 # 4. Options (fixed defaults - no questions)
 # -----------------------------------------------------------------------------
-use_centre = True
+use_centre = False
 rotate = True
 skip_dupes = True
 write_comments = True
-only_view_level = True
 
 # -----------------------------------------------------------------------------
 # 5. Wattage (read from link, write to host)
@@ -553,109 +719,264 @@ def write_watts(parameter, watts, text):
 # 6. Analyse every linked fixture (nothing changes yet)
 # -----------------------------------------------------------------------------
 levels = sorted(FilteredElementCollector(doc).OfClass(Level), key=lambda level: level.Elevation)
-view_level = active_view.GenLevel if view_based else None
+link_levels = sorted(
+    FilteredElementCollector(linked_doc).OfClass(Level),
+    key=lambda level: level.Elevation
+)
+views_by_level = {}
+for plan_view in FilteredElementCollector(doc).OfClass(ViewPlan):
+    if plan_view.IsTemplate:
+        continue
+    try:
+        plan_level = plan_view.GenLevel
+    except Exception:
+        plan_level = None
+    if plan_level is not None:
+        views_by_level.setdefault(id_value(plan_level.Id), []).append(plan_view)
+
+for plan_views in views_by_level.values():
+    plan_views.sort(key=lambda view: (
+        0 if view.Id == active_view.Id else 1,
+        view.Name.lower()
+    ))
+
 
 class FixtureItem(object):
     def __init__(self, key, fixture):
         self.key = key
         self.fixture = fixture
-        self.point, self.rotation = placement_of(fixture, transform, True)       # centre
-        self.insertion, _ = placement_of(fixture, transform, False)              # insertion point
+        self.point, self.rotation = placement_of(fixture, transform, use_centre)
         self.watts, self.watt_text, self.watt_name = linked_wattage(fixture)
-        self.status = "place"          # place | existing (at centre) | move | outside | noloc
+        source_z = transform.Inverse.OfPoint(self.point).Z \
+            if self.point is not None else None
+        self.level = fixture_level(
+            fixture, linked_doc, link_levels, source_z
+        )
+        self.target_level = host_level_for(self.level, transform, levels)
+        self.target_view = None
+        self.status = "place"
+        self.existing_instance = None
         self.existing_id = None
-        self.host_point = None
-        # search radius for an already placed symbol: half the fixture size + 300 mm
-        self.radius = 500.0 / 304.8
-        box = fixture.get_BoundingBox(None)
-        if box is not None:
-            half = math.hypot(box.Max.X - box.Min.X, box.Max.Y - box.Min.Y) / 2.0
-            self.radius = min(max(half + 300.0 / 304.8, 500.0 / 304.8), 3000.0 / 304.8)
 
 
 items = []
 for key in group_keys:
     for fixture in groups[key]:
-        item = FixtureItem(key, fixture)
-        if item.point is None:
-            item.status = "noloc"
-        elif view_based and only_view_level and view_level is not None and levels \
-                and level_for(item.point.Z, levels).Id != view_level.Id:
-            item.status = "outside"
-        items.append(item)
+        items.append(FixtureItem(key, fixture))
 
-# ---- symbols of the 2D family that are ALREADY in the model -----------------
-host_existing = []        # (point, instance)
-collector = FilteredElementCollector(doc, active_view.Id) if view_based else FilteredElementCollector(doc)
-for instance in collector.OfClass(FamilyInstance):
+level_counts = {}
+host_level_by_link_id = {}
+for item in items:
+    if item.level is not None:
+        level_id = id_value(item.level.Id)
+        level_counts[level_id] = level_counts.get(level_id, 0) + 1
+        if item.target_level is not None:
+            host_level_by_link_id[level_id] = item.target_level
+
+if not level_counts:
+    forms.alert(
+        "No linked fixture levels could be identified. Confirm the linked "
+        "model contains Levels and that the lighting fixtures have a level "
+        "association.",
+        exitscript=True
+    )
+
+level_options = [Option(
+    u"All linked levels  ({} fixtures)".format(sum(level_counts.values())),
+    "ALL"
+)]
+for level in link_levels:
+    count = level_counts.get(id_value(level.Id), 0)
+    if count:
+        host_level = host_level_by_link_id.get(id_value(level.Id))
+        host_name = host_level.Name if host_level is not None else "No host level"
+        level_options.append(Option(
+            u"{} -> {}  ({} fixtures)".format(level.Name, host_name, count),
+            level
+        ))
+
+selected_levels = forms.SelectFromList.show(
+    level_options,
+    name_attr="name",
+    multiselect=True,
+    title="Select linked fixture levels (counts use the fixtures' assigned level)",
+    button_name="Use selected levels"
+)
+if not selected_levels:
+    script.exit()
+selected_level_ids = set(level_counts.keys()) if any(
+    option.value == "ALL" for option in selected_levels
+) else set(id_value(option.value.Id) for option in selected_levels)
+selected_level_names = sorted(
+    u"{} -> {}".format(
+        level.Name,
+        host_level_by_link_id[id_value(level.Id)].Name
+        if id_value(level.Id) in host_level_by_link_id else "No host level"
+    )
+    for level in link_levels
+    if id_value(level.Id) in selected_level_ids
+)
+
+for item in items:
+    if item.target_level is not None:
+        item.target_view = next(
+            iter(views_by_level.get(id_value(item.target_level.Id), [])), None
+        )
+
+# Existing instances from the chosen family, including instances in other
+# plan views so each selected level can be updated in its own view.
+existing = []
+for instance in FilteredElementCollector(doc).OfClass(FamilyInstance):
     symbol = instance.Symbol
     if symbol and symbol.Family and symbol.Family.Id == family.Id \
             and isinstance(instance.Location, LocationPoint):
-        host_existing.append((instance.Location.Point, instance))
+        try:
+            owner_view_id = instance.OwnerViewId
+        except Exception:
+            owner_view_id = None
+        source_link_id, source_fixture_id = source_reference_from_comments(instance)
+        existing.append((
+            type_name(symbol), instance.Location.Point, instance,
+            owner_view_id, source_link_id, source_fixture_id
+        ))
 
-
-def plan_distance(a, b):
-    return math.hypot(a.X - b.X, a.Y - b.Y)
-
-
-def same_height(a, b):
-    return view_based or abs(a.Z - b.Z) < 2000.0 / 304.8
-
-
-# 1) pair by the "ID <linked id>" text this tool writes into Comments
-active_items = [i for i in items if i.status == "place"]
-by_linked_id = dict((id_value(i.fixture.Id), i) for i in active_items)
-paired_hosts = set()
-for point, instance in host_existing:
-    comments = instance.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
-    text = comments.AsString() if comments else None
-    if not text or linked_doc.Title not in text:
+matched_existing_ids = set()
+for item in items:
+    if item.point is None:
+        item.status = "noloc"
         continue
-    found = re.search(r"ID (\d+)", text)
-    item = by_linked_id.get(int(found.group(1))) if found else None
-    if item is not None and item.existing_id is None:
-        item.existing_id, item.host_point = instance.Id, point
-        paired_hosts.add(id_value(instance.Id))
-
-# 2) pair the rest by distance (nearest first, one symbol per linked fixture)
-grid_cell = 3000.0 / 304.8
-host_grid = {}
-for point, instance in host_existing:
-    if id_value(instance.Id) not in paired_hosts:
-        host_grid.setdefault((int(math.floor(point.X / grid_cell)), int(math.floor(point.Y / grid_cell))),
-                             []).append((point, instance))
-pairs = []
-for item in active_items:
-    if item.existing_id is not None:
+    if item.level is None:
+        item.status = "no_level"
         continue
-    cx, cy = int(math.floor(item.point.X / grid_cell)), int(math.floor(item.point.Y / grid_cell))
-    for dx in (-1, 0, 1):
-        for dy in (-1, 0, 1):
-            for point, instance in host_grid.get((cx + dx, cy + dy), []):
-                if not same_height(point, item.point):
+    if id_value(item.level.Id) not in selected_level_ids:
+        item.status = "outside"
+        continue
+    if item.target_level is None:
+        item.status = "no_host_level"
+        continue
+    if view_based and item.target_view is None:
+        item.status = "no_view"
+        continue
+
+    if skip_dupes:
+        kind, value = mapping[item.key]
+        target_name = type_name(value) if kind == "existing" else value
+        destination = target_point(item, view_based)
+        match = None
+
+        # Script-created symbols keep the linked element id in Comments, so
+        # they can be found and realigned even if they drifted well away.
+        for record in existing:
+            name, point, instance, owner_view_id, source_link_id, source_fixture_id = record
+            instance_id = id_value(instance.Id)
+            if instance_id in matched_existing_ids \
+                    or source_fixture_id != id_value(item.fixture.Id) \
+                    or (source_link_id is not None
+                        and source_link_id != id_value(link.Id)):
+                continue
+            if view_based:
+                owner_view = plan_view_for_level(
+                    owner_view_id, item.target_level
+                )
+                if owner_view is None:
                     continue
-                distance = min(plan_distance(point, item.point),
-                               plan_distance(point, item.insertion) if item.insertion else 1e9)
-                if distance <= item.radius:
-                    pairs.append((distance, item, point, instance))
-pairs.sort(key=lambda pair: pair[0])
-for distance, item, point, instance in pairs:
-    if item.existing_id is not None or id_value(instance.Id) in paired_hosts:
-        continue
-    item.existing_id, item.host_point = instance.Id, point
-    paired_hosts.add(id_value(instance.Id))
+                item.target_view = owner_view
+            match = record
+            break
 
-# 3) paired symbol already at the centre -> OK, otherwise it must be moved
-for item in active_items:
-    if item.existing_id is None:
-        continue
-    item.status = "existing" if is_near(item.host_point, item.point, view_based) else "move"
+        # Prefer nearby untagged symbols of the chosen family, without reusing
+        # one existing symbol for more than one linked fixture.
+        if match is None:
+            nearest_distance = DUPLICATE_TOLERANCE
+            for record in existing:
+                name, point, instance, owner_view_id, source_link_id, source_fixture_id = record
+                if id_value(instance.Id) in matched_existing_ids \
+                        or source_fixture_id is not None:
+                    continue
+                if view_based:
+                    owner_view = plan_view_for_level(
+                        owner_view_id, item.target_level
+                    )
+                    if owner_view is None:
+                        continue
+                elif not same_floor(instance, destination, item):
+                    continue
+                # plan distance: a symbol at the WRONG HEIGHT is still found
+                # (and then corrected) instead of being duplicated
+                distance = point_distance(point, destination, True)
+                if distance < nearest_distance:
+                    nearest_distance = distance
+                    match = record
+                    if view_based:
+                        item.target_view = owner_view
+
+        # Older/manual symbols may be displaced by more than the proximity
+        # tolerance. If the type and level identify a clear candidate, reuse
+        # the nearest unmatched symbol so it is realigned instead of duplicated.
+        if match is None:
+            nearest_distance = None
+            for record in existing:
+                name, point, instance, owner_view_id, source_link_id, source_fixture_id = record
+                if id_value(instance.Id) in matched_existing_ids \
+                        or source_fixture_id is not None \
+                        or not same(name, target_name):
+                    continue
+                if view_based:
+                    owner_view = plan_view_for_level(
+                        owner_view_id, item.target_level
+                    )
+                    if owner_view is None:
+                        continue
+                elif not same_floor(instance, destination, item):
+                    continue
+                # plan distance: a symbol at the WRONG HEIGHT is still found
+                # (and then corrected) instead of being duplicated
+                distance = point_distance(point, destination, True)
+                if nearest_distance is None or distance < nearest_distance:
+                    nearest_distance = distance
+                    match = record
+                    if view_based:
+                        item.target_view = owner_view
+
+        if match is not None:
+            name, point, instance = match[0], match[1], match[2]
+            matched_existing_ids.add(id_value(instance.Id))
+            alignment_error = point_distance(point, destination, view_based)   # 3D for model families
+            instance_location = instance.Location
+            rotation_error = (
+                abs(rotation_difference(
+                    item.rotation, instance_location.Rotation
+                ))
+                if rotate and isinstance(instance_location, LocationPoint)
+                else 0.0
+            )
+            item.existing_instance = instance
+            item.existing_id = instance.Id
+            item.status = (
+                "existing"
+                if same(name, target_name)
+                and alignment_error <= ALIGN_TOLERANCE
+                and rotation_error <= ROTATION_TOLERANCE
+                else "update"
+            )
 
 to_place = [i for i in items if i.status == "place"]
 already = [i for i in items if i.status == "existing"]
-to_move = [i for i in items if i.status == "move"]
+updates = [i for i in items if i.status == "update"]
 outside = [i for i in items if i.status == "outside"]
-with_watts = [i for i in items if i.watts is not None]
+no_view = [i for i in items if i.status == "no_view"]
+no_location = [i for i in items if i.status in ("noloc", "no_level")]
+no_host_level = [i for i in items if i.status == "no_host_level"]
+selected_items = [
+    item for item in items
+    if item.level is not None
+    and id_value(item.level.Id) in selected_level_ids
+]
+selected_group_keys = sorted(
+    set(item.key for item in selected_items),
+    key=lambda key: (key[0].lower(), key[1].lower())
+)
+with_watts = [i for i in selected_items if i.watts is not None]
 
 # does the 2D family have somewhere to write the wattage?
 probe_name = next((i.watt_name for i in with_watts), None)
@@ -664,18 +985,22 @@ probe_instance = next((i for i in FilteredElementCollector(doc).OfClass(FamilyIn
                        if i.Symbol and i.Symbol.Family and i.Symbol.Family.Id == family.Id), None)
 probe_param, probe_level = target_wattage_parameter(probe_instance, base_symbol, probe_name)
 watt_note = (u"Wattage found on {} of {} linked fixture(s) (parameter '{}').".format(
-    len(with_watts), len(items), probe_name) if with_watts else u"No wattage found on the linked fixtures.")
+    len(with_watts), len(selected_items), probe_name) if with_watts else u"No wattage found on the selected linked fixtures.")
 
 
 def watt_summary(key):
-    values = sorted(set(i.watt_text for i in items if i.key == key and i.watt_text))
+    values = sorted(set(
+        i.watt_text for i in selected_items if i.key == key and i.watt_text
+    ))
     return u", ".join(values) if values else u"-"
 
 
 rows = []
 for key in group_keys:
     kind, value = mapping[key]
-    key_items = [i for i in items if i.key == key]
+    key_items = [i for i in selected_items if i.key == key]
+    if not key_items:
+        continue
     rows.append({
         "linked": u"{} : {}".format(*key),
         "qty": len(key_items),
@@ -683,6 +1008,7 @@ for key in group_keys:
         "match": u"existing ({}%)".format(best_symbol(family_symbols, key)[1]) if kind == "existing" else u"NEW type",
         "watts": watt_summary(key),
         "new": len([i for i in key_items if i.status == "place"]),
+        "update": len([i for i in key_items if i.status == "update"]),
     })
 
 
@@ -741,18 +1067,18 @@ def text_block(text, size=12, bold=False, color="#334155", margin=None):
 STATUS_COLORS = {
     "new_type": Color.FromRgb(245, 158, 11),     # amber  - will be placed with a NEW type
     "existing_type": Color.FromRgb(34, 211, 238),  # cyan - will be placed with your type
-    "existing": Color.FromRgb(100, 116, 139),     # grey  - already placed at the centre
-    "move": Color.FromRgb(168, 85, 247),          # purple - placed earlier, NOT centred: will be moved
-    "outside": Color.FromRgb(239, 68, 68),        # red   - not on the active view level
+    "existing": Color.FromRgb(100, 116, 139),     # grey  - already placed earlier
+    "update": Color.FromRgb(139, 92, 246),        # violet - existing symbol will change type
+    "outside": Color.FromRgb(239, 68, 68),        # red   - not selected or no plan view
 }
 
 
 def item_color_key(item):
     if item.status == "existing":
         return "existing"
-    if item.status == "move":
-        return "move"
-    if item.status in ("outside", "noloc"):
+    if item.status == "update":
+        return "update"
+    if item.status in ("outside", "noloc", "no_level", "no_host_level", "no_view"):
         return "outside"
     return "existing_type" if mapping[item.key][0] == "existing" else "new_type"
 
@@ -761,6 +1087,7 @@ class PreviewWindow(object):
     def __init__(self):
         self.accepted = False
         self.copy_watts = True
+        self.update_existing = bool(updates)
         self.center = Point3D(0, 0, 0)
         self.radius = 10.0
         self.preset = "top"
@@ -786,10 +1113,9 @@ class PreviewWindow(object):
         header.Background = brush("#1E3A8A")
         header.Children.Add(text_block("LIGHT PLACEMENT 2D", 20, True, "#FFFFFF", Thickness(18, 12, 18, 0)))
         header.Children.Add(text_block(
-            u"Link: {}   |   2D family: {}   |   {} fixture(s): {} to place, {} to move to centre, "
-            u"{} already at centre{}".format(
-                linked_doc.Title, family.Name, len(items), len(to_place), len(to_move), len(already),
-                u", {} not on this view's level".format(len(outside)) if outside else u""),
+            u"Link: {}   |   2D family: {}   |   {} fixture(s): {} to place, {} already placed{}".format(
+                linked_doc.Title, family.Name, len(selected_items), len(to_place), len(already),
+                u", {} to update".format(len(updates)) if updates else u""),
             12, False, "#DBEAFE", Thickness(18, 0, 18, 12)))
         DockPanel.SetDock(header, Dock.Top)
         root.Children.Add(header)
@@ -806,18 +1132,28 @@ class PreviewWindow(object):
         self.watt_box.IsEnabled = bool(with_watts)
         self.watt_box.VerticalAlignment = VerticalAlignment.Center
         self.watt_box.Margin = Thickness(0, 0, 12, 0)
+        self.update_box = CheckBox()
+        self.update_box.Content = "Realign / update existing symbols"
+        self.update_box.IsChecked = bool(updates)
+        self.update_box.IsEnabled = bool(updates)
+        self.update_box.VerticalAlignment = VerticalAlignment.Center
+        self.update_box.Margin = Thickness(0, 0, 12, 0)
         cancel = make_button("Cancel", False)
         cancel.IsCancel = True
         cancel.Click += lambda sender, args: window.Close()
-        actions = []
-        if to_place:
-            actions.append(u"Place {}".format(len(to_place)))
-        if to_move:
-            actions.append(u"Move {} to centre".format(len(to_move)))
-        place = make_button(u", ".join(actions) if actions else "Update wattage only", True)
-        place.IsEnabled = bool(to_place) or bool(to_move) or bool(already and with_watts)
+        place = make_button(
+            u"Place {} symbol(s)".format(len(to_place))
+            if to_place else
+            (u"Update existing symbol(s)" if updates else "Update wattage only"),
+            True
+        )
+        place.IsEnabled = bool(to_place) or bool(updates) or bool(already and with_watts)
+        self.place_button = place
+        self.update_box.Checked += self.on_update_option_changed
+        self.update_box.Unchecked += self.on_update_option_changed
         place.Click += self.on_place
         buttons.Children.Add(self.watt_box)
+        buttons.Children.Add(self.update_box)
         buttons.Children.Add(cancel)
         buttons.Children.Add(place)
         DockPanel.SetDock(buttons, Dock.Right)
@@ -854,8 +1190,8 @@ class PreviewWindow(object):
         legend = StackPanel()
         legend.Orientation = Orientation.Horizontal
         for key, label in (("existing_type", "Your existing type"), ("new_type", "New type"),
-                           ("existing", "Already at centre"), ("move", "Will be moved to centre"),
-                           ("outside", "Not on view level")):
+                           ("update", "Different existing type"), ("existing", "Already placed"),
+                           ("outside", "Cannot place / missing level")):
             swatch = Border()
             swatch.Width = 12
             swatch.Height = 12
@@ -890,7 +1226,7 @@ class PreviewWindow(object):
         return page
 
     def build_scene(self):
-        points = [i.point for i in items if i.point is not None]
+        points = [i.point for i in selected_items if i.point is not None]
         if not points:
             return
         min_x = min(p.X for p in points); max_x = max(p.X for p in points)
@@ -901,7 +1237,7 @@ class PreviewWindow(object):
         half = max(self.radius * 0.006, 0.3)
 
         meshes = dict((key, MeshGeometry3D()) for key in STATUS_COLORS)
-        for item in items:
+        for item in selected_items:
             if item.point is not None:
                 self.add_cube(meshes[item_color_key(item)], item.point, half)
         scene = Model3DGroup()
@@ -966,13 +1302,16 @@ class PreviewWindow(object):
     def build_matching(self):
         grid = WpfGrid()
         grid.Margin = Thickness(10)
-        widths = (2.4, 0.5, 2.0, 1.0, 1.2, 0.7)
+        widths = (2.2, 0.4, 1.8, 0.8, 1.0, 0.55, 0.65)
         for width in widths:
             column = ColumnDefinition()
             column.Width = GridLength(width, GridUnitType.Star)
             grid.ColumnDefinitions.Add(column)
-        headers = ("Linked fixture (Family : Type)", "Qty", "Placed as 2D type", "Match", "Wattage (link)", "To place")
-        all_rows = [headers] + [(r["linked"], str(r["qty"]), r["target"], r["match"], r["watts"], str(r["new"]))
+        headers = ("Linked fixture (Family : Type)", "Qty", "Placed as 2D type",
+                   "Match", "Wattage (link)", "To place", "To update")
+        all_rows = [headers] + [(r["linked"], str(r["qty"]), r["target"],
+                                 r["match"], r["watts"], str(r["new"]),
+                                 str(r["update"]))
                                 for r in rows]
         for row_index, values in enumerate(all_rows):
             definition = RowDefinition()
@@ -997,25 +1336,48 @@ class PreviewWindow(object):
     def build_overview(self):
         lines = [
             u"Link: {}".format(linked_doc.Title),
-            u"2D family: {}   ({})".format(family.Name, "view-specific: placed in the active plan view"
-                                          if view_based else "model family: placed at fixture height"),
+            u"Family: {}   ({})".format(family.Name, "view-specific: placed in a plan view for each level"
+                                        if view_based else "model family: placed at fixture height"),
+            u"Selected level(s): {}".format(u", ".join(selected_level_names)),
+            u"Level counts use the linked fixtures' Revit level assignment; "
+            u"the host level is shown after the arrow.",
             u"",
-            u"{} linked lighting fixture(s) in {} type(s).".format(len(items), len(rows)),
+            u"{} linked lighting fixture(s) in {} type(s).".format(
+                len(selected_items), len(rows)),
             u"{} will be placed now.".format(len(to_place)),
-            u"{} symbol(s) placed earlier are NOT at the centre and will be moved to it.".format(len(to_move)),
-            u"{} already have a symbol at the centre (wattage is refreshed on those).".format(len(already)),
+            u"{} symbols already match the type and location.".format(len(already)),
             u"{} use your existing types, {} new type(s) will be created.".format(
-                sum(1 for k in group_keys if mapping[k][0] == "existing"),
-                sum(1 for k in group_keys if mapping[k][0] == "new")),
+                sum(1 for k in selected_group_keys if mapping[k][0] == "existing"),
+                sum(1 for k in selected_group_keys if mapping[k][0] == "new")),
         ]
+        lines.append(u"{} existing symbol(s) can be realigned and/or changed to the matched type "
+                     u"(includes symbols at the wrong elevation).".format(len(updates)))
+        if not view_based:
+            lines.append(u"Model symbols are set to the linked fixture's exact elevation; the real height is "
+                         u"measured after placing and corrected (within 1 mm).")
+        if not view_based and id_value(family.FamilyCategory.Id) == int(
+                BuiltInCategory.OST_LightingFixtures):
+            lines.append(
+                u"Matched fixtures' circuits will be reset to automatic All Devices wire paths. "
+                u"Circuit membership and panel assignment are preserved; manual wire paths are replaced."
+            )
         if outside:
-            lines.append(u"{} skipped: not on the active view's level.".format(len(outside)))
+            lines.append(u"{} skipped: outside the selected levels.".format(len(outside)))
+        if no_view:
+            lines.append(u"{} skipped: no plan view is assigned to the matching level.".format(
+                len(no_view)))
+        if no_location:
+            lines.append(u"{} skipped: no point location or linked level could be determined.".format(
+                len(no_location)))
+        if no_host_level:
+            lines.append(u"{} skipped: no matching host level.".format(
+                len(no_host_level)))
         lines += [u"", watt_note]
         if with_watts:
             lines.append(u"Wattage is written to: {}".format(
                 u"'{}' ({} parameter)".format(probe_param.Definition.Name, probe_level) if probe_param is not None
                 else u"the placed symbol's own 'Wattage' instance parameter if it has one."))
-        lines += [u"", u"Shift+Click the button to choose another 2D family.",
+        lines += [u"", u"Choose the 2D family each run. Missing types are created in that family.",
                   u"One Ctrl+Z undoes everything."]
         block = text_block(u"\n".join(lines), 13, False, "#0F172A", Thickness(16))
         frame = Border()
@@ -1027,7 +1389,21 @@ class PreviewWindow(object):
     def on_place(self, sender, args):
         self.accepted = True
         self.copy_watts = self.watt_box.IsChecked == True
+        self.update_existing = self.update_box.IsChecked == True
         self.window.Close()
+
+    def on_update_option_changed(self, sender, args):
+        self.place_button.IsEnabled = (
+            bool(to_place)
+            or (bool(updates) and self.update_box.IsChecked == True)
+            or bool(already and with_watts)
+        )
+        if to_place:
+            self.place_button.Content = u"Place {} symbol(s)".format(len(to_place))
+        elif updates and self.update_box.IsChecked == True:
+            self.place_button.Content = "Update existing symbol(s)"
+        else:
+            self.place_button.Content = "Update wattage only"
 
     def show(self):
         self.window.ShowDialog()
@@ -1038,22 +1414,22 @@ preview = PreviewWindow()
 if not preview.show():
     script.exit()
 copy_watts = preview.copy_watts
+to_update = updates if preview.update_existing else []
 
 
 # -----------------------------------------------------------------------------
 # 8. Place + copy wattage (one transaction)
 # -----------------------------------------------------------------------------
 placed = 0
-moved = []                # [linked type, host symbol link, distance moved mm]
+updated = 0
 watt_written = 0
 watt_missing_target = 0
 created_types = []
 failed = []
 placed_per_type = {}
 type_watts = {}        # type-level wattage: symbol id -> set of values written
-# 2D type name each linked type should end up with (updated with the real names below)
-final_type = dict((key, type_name(mapping[key][1]) if mapping[key][0] == "existing" else mapping[key][1])
-                  for key in group_keys)
+affected_circuit_ids = set()
+routed_circuits = 0
 
 
 def apply_watts(instance, item):
@@ -1070,6 +1446,29 @@ def apply_watts(instance, item):
             type_watts.setdefault(type_name(instance.Symbol), set()).add(item.watt_text)
 
 
+def write_source_comments(instance, item):
+    if not write_comments:
+        return
+    comments = instance.get_Parameter(
+        BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS
+    )
+    if comments and not comments.IsReadOnly:
+        source_label = u"{} : {}".format(*item.key)
+        comments.Set(u"{} | Link instance {} | ID {} | {}".format(
+            linked_doc.Title,
+            id_value(link.Id),
+            id_value(item.fixture.Id),
+            source_label
+        ))
+
+
+def connected_circuit_ids(instance):
+    mep_model = instance.MEPModel
+    if mep_model is None:
+        return set()
+    return set(id_value(system.Id) for system in mep_model.GetElectricalSystems())
+
+
 transaction = Transaction(doc, "Place 2D lighting symbols from link")
 handling = transaction.GetFailureHandlingOptions()
 handling.SetFailuresPreprocessor(WarningSwallower())
@@ -1079,7 +1478,10 @@ try:
     used_lower = set(type_name(s).lower() for s in family_symbols)
     symbol_for = {}
     for key in group_keys:
-        if not any(i.key == key and i.status == "place" for i in items):
+        if not any(i.key == key and (
+                i.status == "place" or
+                (preview.update_existing and i.status == "update")
+        ) for i in items):
             continue        # nothing new to place for this type
         kind, value = mapping[key]
         if kind == "existing":
@@ -1093,43 +1495,61 @@ try:
         except Exception as error:
             failed.append([u"{} : {}".format(*key), "", u"New type '{}' not created: {}".format(value, error)])
 
-    for key in group_keys:
-        if key in symbol_for:
-            final_type[key] = type_name(symbol_for[key])
     for symbol in symbol_for.values():
         if not symbol.IsActive:
             symbol.Activate()
     doc.Regenerate()
-
-    # move symbols placed earlier to the centre of their linked fixture
-    for item in to_move:
-        label = u"{} : {}".format(*item.key)
-        instance = doc.GetElement(item.existing_id)
-        if instance is None:
-            continue
-        sub = SubTransaction(doc)
-        sub.Start()
-        try:
-            current = instance.Location.Point
-            delta = XYZ(item.point.X - current.X, item.point.Y - current.Y,
-                        0.0 if view_based else item.point.Z - current.Z)
-            ElementTransformUtils.MoveElement(doc, instance.Id, delta)
-            apply_watts(instance, item)
-            sub.Commit()
-            moved.append([label, output.linkify(instance.Id),
-                          int(round(math.hypot(delta.X, delta.Y) * 304.8))])
-        except Exception as error:
-            sub.RollBack()
-            failed.append([label, id_value(item.fixture.Id), u"move to centre: {}".format(error)])
 
     # refresh wattage on symbols placed in an earlier run
     for item in already:
         instance = doc.GetElement(item.existing_id)
         if instance is not None:
             try:
+                affected_circuit_ids.update(connected_circuit_ids(instance))
                 apply_watts(instance, item)
             except Exception as error:
-                failed.append([u"{} : {}".format(*item.key), id_value(item.fixture.Id), u"wattage: {}".format(error)])
+                failed.append([u"{} : {}".format(*item.key), id_value(item.fixture.Id),
+                               u"circuit lookup / wattage: {}".format(error)])
+
+    for item in to_update:
+        symbol = symbol_for.get(item.key)
+        source_label = u"{} : {}".format(*item.key)
+        if symbol is None:
+            failed.append([source_label, id_value(item.fixture.Id), "No 2D type available for update"])
+            continue
+        sub = SubTransaction(doc)
+        sub.Start()
+        try:
+            instance = doc.GetElement(item.existing_id)
+            if instance is None:
+                raise Exception("Existing symbol instance was not found.")
+            previous_circuit_ids = connected_circuit_ids(instance)
+            changed_id = instance.ChangeTypeId(symbol.Id)
+            if changed_id is not None and changed_id != ElementId.InvalidElementId:
+                instance = doc.GetElement(changed_id) or instance
+            else:
+                instance = doc.GetElement(item.existing_id) or instance
+            if connected_circuit_ids(instance) != previous_circuit_ids:
+                raise Exception(
+                    "Changing this fixture would change its circuit membership; "
+                    "the update was rolled back."
+                )
+            align_instance(instance, item, view_based)
+            if connected_circuit_ids(instance) != previous_circuit_ids:
+                raise Exception(
+                    "Moving this fixture changed its circuit membership; "
+                    "the update was rolled back."
+                )
+            write_source_comments(instance, item)
+            apply_watts(instance, item)
+            sub.Commit()
+            affected_circuit_ids.update(previous_circuit_ids)
+            updated += 1
+            label = type_name(symbol)
+            placed_per_type[label] = placed_per_type.get(label, 0) + 1
+        except Exception as error:
+            sub.RollBack()
+            failed.append([source_label, id_value(item.fixture.Id), u"update: {}".format(error)])
 
     for item in to_place:
         symbol = symbol_for.get(item.key)
@@ -1141,19 +1561,22 @@ try:
         sub.Start()
         try:
             if view_based:
-                instance = place_in_view(symbol, item.point)
+                instance = place_in_view(
+                    symbol, item.point, item.target_view, item.target_level
+                )
             else:
-                instance = place_in_model(link, transform, item.fixture, symbol, item.point, levels)
+                instance = place_in_model(
+                    link, transform, item.fixture, symbol, item.point,
+                    levels, item.target_level
+                )
             location = instance.Location
             if rotate and abs(item.rotation) > 1e-6 and isinstance(location, LocationPoint) \
                     and not is_face_hosted(instance):
                 origin = location.Point
                 ElementTransformUtils.RotateElement(
                     doc, instance.Id, Line.CreateBound(origin, origin + XYZ.BasisZ), item.rotation)
-            if write_comments:
-                comments = instance.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
-                if comments and not comments.IsReadOnly:
-                    comments.Set(u"{} | ID {} | {}".format(linked_doc.Title, id_value(item.fixture.Id), source_label))
+            check_elevation(instance, item)
+            write_source_comments(instance, item)
             apply_watts(instance, item)
             sub.Commit()
             placed += 1
@@ -1163,7 +1586,26 @@ try:
             sub.RollBack()
             failed.append([source_label, id_value(item.fixture.Id), str(error)])
 
-    if placed == 0 and not moved and not created_types and watt_written == 0:
+    if affected_circuit_ids:
+        found_circuit_ids = set()
+        for circuit in FilteredElementCollector(doc).OfClass(ElectricalSystem):
+            circuit_id = id_value(circuit.Id)
+            if circuit_id not in affected_circuit_ids:
+                continue
+            circuit.CircuitPathMode = ElectricalCircuitPathMode.AllDevices
+            found_circuit_ids.add(circuit_id)
+            routed_circuits += 1
+        missing_circuits = affected_circuit_ids - found_circuit_ids
+        if missing_circuits:
+            raise Exception(
+                "Could not find affected electrical circuit(s): {}".format(
+                    u", ".join(str(circuit_id) for circuit_id in sorted(missing_circuits))
+                )
+            )
+        doc.Regenerate()
+
+    if placed == 0 and updated == 0 and routed_circuits == 0 \
+            and not created_types and watt_written == 0:
         transaction.RollBack()
     else:
         transaction.Commit()
@@ -1174,117 +1616,7 @@ except Exception:
 
 
 # -----------------------------------------------------------------------------
-# 9. VERIFY TYPES - is every linked fixture TYPE copied properly to the 2D family?
-#    For each linked "Family : Type":
-#      * does the 2D family now have the matching type?
-#      * is its name the same as the linked type name?
-#      * is the wattage the same as in the link?
-#      * are there as many 2D symbols of that type as linked fixtures?
-# -----------------------------------------------------------------------------
-WATT_TOLERANCE = 0.5      # W
-
-host_type_by_name = {}
-for symbol_id in family.GetFamilySymbolIds():
-    symbol = doc.GetElement(symbol_id)
-    if symbol is not None:
-        host_type_by_name[type_name(symbol).lower()] = symbol
-
-host_instances = {}       # type name (lower) -> [instances]
-count_collector = FilteredElementCollector(doc, active_view.Id) if view_based else FilteredElementCollector(doc)
-for instance in count_collector.OfClass(FamilyInstance):
-    symbol = instance.Symbol
-    if symbol and symbol.Family and symbol.Family.Id == family.Id:
-        host_instances.setdefault(type_name(symbol).lower(), []).append(instance)
-
-
-def linked_type_watts(key):
-    """Wattage of the linked TYPE (type parameter), else the instance values."""
-    symbol = groups[key][0].Symbol
-    for name in WATT_NAMES:
-        watts, text = read_watts(symbol.LookupParameter(name))
-        if watts is not None:
-            return [(watts, text)], name
-    values = {}
-    name = None
-    for item in items:
-        if item.key == key and item.watts is not None:
-            values[round(item.watts, 2)] = (item.watts, item.watt_text)
-            name = item.watt_name
-    return list(values.values()), name
-
-
-def host_type_watts(symbol, source_name, instances):
-    """Wattage on the 2D TYPE (type parameter), else on its placed instances."""
-    parameter, level = target_wattage_parameter(None, symbol, source_name)
-    if parameter is not None:
-        watts, text = read_watts(parameter)
-        return ([(watts, text)] if watts is not None else []), "type"
-    values = {}
-    for instance in instances:
-        parameter, _ = target_wattage_parameter(instance, None, source_name)
-        if parameter is not None:
-            watts, text = read_watts(parameter)
-            if watts is not None:
-                values[round(watts, 2)] = (watts, text)
-    return list(values.values()), ("instance" if instances else "none")
-
-
-def watts_text(values):
-    return u", ".join(sorted(set(t for _, t in values))) if values else u"-"
-
-
-type_check = []           # rows for the table
-type_ok = 0
-type_issues = 0
-for key in group_keys:
-    linked_label = u"{} : {}".format(*key)
-    linked_qty = len([i for i in items if i.key == key and i.status not in ("outside", "noloc")])
-    expected = final_type.get(key) or u""
-    symbol = host_type_by_name.get(expected.lower())
-    issues = []
-
-    if symbol is None:
-        issues.append(u"TYPE MISSING in 2D family")
-        host_name, host_qty, host_w = u"-", 0, []
-    else:
-        host_name = type_name(symbol)
-        instances = host_instances.get(host_name.lower(), [])
-        host_qty = len(instances)
-        if not same(host_name, key[1]) and not same(host_name, u"{} - {}".format(*key)):
-            issues.append(u"NAME differs from linked type")
-        if host_qty < linked_qty:
-            issues.append(u"{} symbol(s) missing".format(linked_qty - host_qty))
-        link_w, watt_name = linked_type_watts(key)
-        host_w, _ = host_type_watts(symbol, watt_name, instances)
-        if link_w:
-            link_values = set(round(w, 1) for w, _ in link_w)
-            host_values = set(round(w, 1) for w, _ in host_w)
-            if not host_w:
-                issues.append(u"WATTAGE not copied")
-            elif any(min(abs(h - l) for l in link_values) > WATT_TOLERANCE for h in host_values) \
-                    or any(min(abs(l - h) for h in host_values) > WATT_TOLERANCE for l in link_values):
-                issues.append(u"WATTAGE differs")
-    link_w_display = watts_text(linked_type_watts(key)[0])
-
-    status = u"OK" if not issues else u"; ".join(issues)
-    if issues:
-        type_issues += 1
-    else:
-        type_ok += 1
-    type_check.append([status, linked_label, host_name, link_w_display, watts_text(host_w),
-                       linked_qty, host_qty])
-
-output.print_md(u"## Type check: {} of {} linked type(s) copied correctly to '{}'".format(
-    type_ok, len(group_keys), family.Name))
-output.print_table(
-    table_data=sorted(type_check, key=lambda r: (r[0] == u"OK", r[1].lower())),
-    columns=["Status", "Linked type (Family : Type)", "2D type in host", "Wattage (link)",
-             "Wattage (host)", "Linked qty", "2D qty"],
-    title="Linked fixture types vs 2D family types")
-
-
-# -----------------------------------------------------------------------------
-# 10. Report
+# 9. Report
 # -----------------------------------------------------------------------------
 conflicts = [[name, u", ".join(sorted(values))] for name, values in type_watts.items() if len(values) > 1]
 
@@ -1294,39 +1626,59 @@ output.print_table(table_data=[[r["linked"], r["qty"], r["target"], r["match"], 
                    title="Type matching")
 if placed_per_type:
     output.print_table(table_data=[[n, c] for n, c in sorted(placed_per_type.items())],
-                       columns=["2D type", "Placed"], title="Placed per type")
+                       columns=["2D type", "Placed / updated"], title="Placed per type")
 if created_types:
     output.print_table(table_data=[[n] for n in created_types], columns=["New type"], title="New types created")
-if moved:
-    output.print_table(table_data=moved, columns=["Linked type", "2D symbol (click)", "Moved (mm)"],
-                       title=u"Moved to the centre of the linked fixture ({})".format(len(moved)))
 if conflicts:
     output.print_table(table_data=conflicts, columns=["2D type", "Different wattages written"],
                        title="Wattage is a TYPE parameter but the linked fixtures differ - make it an instance parameter")
 if failed:
     output.print_table(table_data=failed, columns=["Linked type", "Linked ID", "Reason"], title="Not placed")
+if elevation_problems:
+    output.print_table(
+        table_data=elevation_problems,
+        columns=["Linked type", "Linked ID", "Linked elevation (mm)", "Host symbol elevation (mm)"],
+        title="Elevation could not be matched (hosted family? use a non-hosted 2D family)")
 
 summary = [
     u"{} symbol(s) placed.".format(placed),
+    u"{} existing symbol(s) realigned and/or updated to the matched type.".format(updated),
     u"{} new type(s) created.".format(len(created_types)),
-    u"{} placed earlier moved to the fixture centre.".format(len(moved)),
-    u"{} were already at the centre.".format(len(already)),
+    u"{} already placed earlier (skipped).".format(len(already)),
 ]
+if routed_circuits:
+    summary.append(
+        u"{} affected circuit(s) reset to automatic All Devices wire paths; "
+        u"membership and panel assignment were not changed.".format(routed_circuits)
+    )
+elif not view_based and id_value(family.FamilyCategory.Id) == int(
+        BuiltInCategory.OST_LightingFixtures):
+    summary.append("No connected circuits were found on the matched fixtures; no wire paths were recalculated.")
 if outside:
-    summary.append(u"{} skipped: not on the active view's level.".format(len(outside)))
+    summary.append(u"{} skipped: outside the selected levels.".format(len(outside)))
+if no_view:
+    summary.append(u"{} skipped: no plan view is assigned to the matching level.".format(
+        len(no_view)))
+if no_location:
+    summary.append(u"{} skipped: no point location or linked level could be determined.".format(
+        len(no_location)))
+if no_host_level:
+    summary.append(u"{} skipped: no matching host level.".format(
+        len(no_host_level)))
+summary.insert(0, u"Selected linked level(s): {}".format(
+    u", ".join(selected_level_names)))
 if copy_watts:
     summary.append(u"Wattage copied to {} symbol(s).".format(watt_written))
     if watt_missing_target:
         summary.append(u"{} symbol(s) have no wattage parameter - add an instance parameter "
                        u"'Wattage' to the 2D family.".format(watt_missing_target))
+if not view_based:
+    if elevation_problems:
+        summary.append(u"{} symbol(s) could NOT be set to the linked elevation - see the output window."
+                       .format(len(elevation_problems)))
+    elif placed or updated:
+        summary.append(u"Elevation checked: every placed / updated symbol is at the linked fixture's "
+                       u"elevation (within 1 mm).")
 if failed:
     summary.append(u"{} problem(s) - see the output window.".format(len(failed)))
-summary.append(u"")
-if type_issues == 0:
-    summary.append(u"TYPE CHECK OK: all {} linked type(s) exist in '{}' with the right name{}.".format(
-        len(group_keys), family.Name, u" and wattage" if copy_watts and with_watts else u""))
-else:
-    summary.append(u"TYPE CHECK: {} of {} type(s) OK, {} with problems "
-                   u"(missing type, name, wattage or count).".format(type_ok, len(group_keys), type_issues))
-    summary.append(u"See the 'Linked fixture types vs 2D family types' table in the output window.")
 forms.alert(u"\n".join(summary) + u"\n\nOne Ctrl+Z undoes everything.", title="Light Placement 2D")
