@@ -3,9 +3,9 @@ __title__ = "LIGHT\nPLACEMENT 2D"
 __doc__ = (
     "Choose a lighting link, the levels to process and one 2D annotation "
     "family. Existing matching types are reused and missing types are created "
-    "inside that family. Fixtures that already have a symbol within 350 mm are "
-    "left untouched (wiring and circuits are not changed); only new symbols are "
-    "added."
+    "inside that family. Existing symbols within 350 mm are aligned onto the "
+    "linked fixture (moved only - circuits kept); new symbols are added only "
+    "where none exists."
 )
 
 # =============================================================================
@@ -20,8 +20,9 @@ __doc__ = (
 #     * position   : linked fixture insertion point, transformed to host coords
 #     * existing   : if ANY symbol (chosen 2D family or a host lighting fixture)
 #                    is within 350 mm of the linked fixture on the same floor,
-#                    it counts as existing and is LEFT UNTOUCHED - no move, no
-#                    type change, no parameters, no circuit / wire changes.
+#                    it counts as existing and is ALIGNED onto the linked
+#                    fixture (moved only: no type change, no parameters; the
+#                    move is undone if it would change the element's circuit).
 #                    Only linked fixtures with no symbol nearby get a new one.
 #     * wattage    : read from each linked fixture (instance or type) and
 #                    written to the placed 2D symbol (same parameter name, or
@@ -905,8 +906,39 @@ for distance, item, record in pairs:
     item.status = "existing"
     used_existing.add(instance_id)
 
+def is_view_specific(instance):
+    try:
+        owner = instance.OwnerViewId
+        return owner is not None and owner != ElementId.InvalidElementId
+    except Exception:
+        return False
+
+
+def align_target(item):
+    """Where the existing symbol must go: linked fixture X/Y, and its Z too for
+    model elements that are not hosted on a face (a hosted one keeps its host)."""
+    instance = item.existing_instance
+    current = instance.Location.Point
+    if is_view_specific(instance) or is_face_hosted(instance):
+        return XYZ(item.point.X, item.point.Y, current.Z)
+    return item.point
+
+
+# existing symbol within 350 mm but not exactly on the linked fixture -> "align"
+for item in items:
+    if item.status != "existing":
+        continue
+    try:
+        current = item.existing_instance.Location.Point
+        item.align_distance = point_distance(current, align_target(item), False)
+        if item.align_distance > ALIGN_TOLERANCE:
+            item.status = "align"
+    except Exception:
+        pass
+
 to_place = [i for i in items if i.status == "place"]
 already = [i for i in items if i.status == "existing"]
+to_align = [i for i in items if i.status == "align"]
 outside = [i for i in items if i.status == "outside"]
 no_view = [i for i in items if i.status == "no_view"]
 no_location = [i for i in items if i.status in ("noloc", "no_level")]
@@ -952,7 +984,8 @@ for key in group_keys:
         "match": u"existing ({}%)".format(best_symbol(family_symbols, key)[1]) if kind == "existing" else u"NEW type",
         "watts": watt_summary(key),
         "new": len([i for i in key_items if i.status == "place"]),
-        "existing": len([i for i in key_items if i.status == "existing"]),
+        "existing": u"{} / {}".format(len([i for i in key_items if i.status == "align"]),
+                                      len([i for i in key_items if i.status == "existing"])),
     })
 
 
@@ -1011,7 +1044,8 @@ def text_block(text, size=12, bold=False, color="#334155", margin=None):
 STATUS_COLORS = {
     "new_type": Color.FromRgb(245, 158, 11),     # amber  - will be placed with a NEW type
     "existing_type": Color.FromRgb(34, 211, 238),  # cyan - will be placed with your type
-    "existing": Color.FromRgb(100, 116, 139),     # grey  - already placed earlier
+    "existing": Color.FromRgb(100, 116, 139),     # grey  - existing, already aligned
+    "align": Color.FromRgb(168, 85, 247),         # purple - existing within 350 mm, will be aligned
     "outside": Color.FromRgb(239, 68, 68),        # red   - not selected or no plan view
 }
 
@@ -1019,6 +1053,8 @@ STATUS_COLORS = {
 def item_color_key(item):
     if item.status == "existing":
         return "existing"
+    if item.status == "align":
+        return "align"
     if item.status in ("outside", "noloc", "no_level", "no_host_level", "no_view"):
         return "outside"
     return "existing_type" if mapping[item.key][0] == "existing" else "new_type"
@@ -1053,9 +1089,9 @@ class PreviewWindow(object):
         header.Background = brush("#1E3A8A")
         header.Children.Add(text_block("LIGHT PLACEMENT 2D", 20, True, "#FFFFFF", Thickness(18, 12, 18, 0)))
         header.Children.Add(text_block(
-            u"Link: {}   |   2D family: {}   |   {} fixture(s): {} NEW to place, {} already have a "
-            u"symbol within 350 mm (left untouched)".format(
-                linked_doc.Title, family.Name, len(selected_items), len(to_place), len(already)),
+            u"Link: {}   |   2D family: {}   |   {} fixture(s): {} NEW to place, {} existing within 350 mm "
+            u"to ALIGN, {} already aligned".format(
+                linked_doc.Title, family.Name, len(selected_items), len(to_place), len(to_align), len(already)),
             12, False, "#DBEAFE", Thickness(18, 0, 18, 12)))
         DockPanel.SetDock(header, Dock.Top)
         root.Children.Add(header)
@@ -1072,17 +1108,23 @@ class PreviewWindow(object):
         self.watt_box.IsEnabled = bool(with_watts)
         self.watt_box.VerticalAlignment = VerticalAlignment.Center
         self.watt_box.Margin = Thickness(0, 0, 12, 0)
+        self.align_box = CheckBox()
+        self.align_box.Content = u"Align existing within 350 mm ({})".format(len(to_align))
+        self.align_box.IsChecked = bool(to_align)
+        self.align_box.IsEnabled = bool(to_align)
+        self.align_box.VerticalAlignment = VerticalAlignment.Center
+        self.align_box.Margin = Thickness(0, 0, 12, 0)
         cancel = make_button("Cancel", False)
         cancel.IsCancel = True
         cancel.Click += lambda sender, args: window.Close()
-        place = make_button(
-            u"Place {} new symbol(s)".format(len(to_place)) if to_place else u"Nothing new to place",
-            True
-        )
-        place.IsEnabled = bool(to_place)
+        place = make_button(u"", True)
         self.place_button = place
+        self.refresh_button()
+        self.align_box.Checked += lambda sender, args: self.refresh_button()
+        self.align_box.Unchecked += lambda sender, args: self.refresh_button()
         place.Click += self.on_place
         buttons.Children.Add(self.watt_box)
+        buttons.Children.Add(self.align_box)
         buttons.Children.Add(cancel)
         buttons.Children.Add(place)
         DockPanel.SetDock(buttons, Dock.Right)
@@ -1119,7 +1161,7 @@ class PreviewWindow(object):
         legend = StackPanel()
         legend.Orientation = Orientation.Horizontal
         for key, label in (("existing_type", "Your existing type"), ("new_type", "New type"),
-                           ("existing", "Existing within 350 mm (untouched)"),
+                           ("align", "Existing - will be aligned"), ("existing", "Existing - already aligned"),
                            ("outside", "Cannot place / missing level")):
             swatch = Border()
             swatch.Width = 12
@@ -1237,7 +1279,7 @@ class PreviewWindow(object):
             column.Width = GridLength(width, GridUnitType.Star)
             grid.ColumnDefinitions.Add(column)
         headers = ("Linked fixture (Family : Type)", "Qty", "Placed as 2D type",
-                   "Match", "Wattage (link)", "New", "Existing")
+                   "Match", "Wattage (link)", "New", "Align / ok")
         all_rows = [headers] + [(r["linked"], str(r["qty"]), r["target"],
                                  r["match"], r["watts"], str(r["new"]),
                                  str(r["existing"]))
@@ -1274,13 +1316,15 @@ class PreviewWindow(object):
             u"{} linked lighting fixture(s) in {} type(s).".format(
                 len(selected_items), len(rows)),
             u"{} will be placed now.".format(len(to_place)),
-            u"{} already have a symbol within 350 mm - they are NOT changed "
-            u"(no move, no type change, no parameters, no circuit / wire changes).".format(len(already)),
+            u"{} existing symbol(s) within 350 mm will be ALIGNED to the linked fixture "
+            u"(moved only - type, parameters and circuits stay the same).".format(len(to_align)),
+            u"{} existing symbol(s) are already exactly on the linked fixture.".format(len(already)),
             u"{} use your existing types, {} new type(s) will be created.".format(
                 sum(1 for k in selected_group_keys if mapping[k][0] == "existing"),
                 sum(1 for k in selected_group_keys if mapping[k][0] == "new")),
         ]
-        lines.append(u"Only NEW symbols are added; existing wiring and circuits are not touched.")
+        lines.append(u"Aligning only moves the symbol: circuit membership is checked before and after each "
+                     u"move and the move is undone if it would change a circuit. Wires stay connected.")
         if outside:
             lines.append(u"{} skipped: outside the selected levels.".format(len(outside)))
         if no_view:
@@ -1306,9 +1350,20 @@ class PreviewWindow(object):
         frame.Child = block
         return frame
 
+    def refresh_button(self):
+        align = bool(to_align) and self.align_box.IsChecked == True
+        parts = []
+        if to_place:
+            parts.append(u"Place {} new".format(len(to_place)))
+        if align:
+            parts.append(u"Align {} existing".format(len(to_align)))
+        self.place_button.Content = u", ".join(parts) if parts else u"Nothing to do"
+        self.place_button.IsEnabled = bool(parts)
+
     def on_place(self, sender, args):
         self.accepted = True
         self.copy_watts = self.watt_box.IsChecked == True
+        self.align_existing = self.align_box.IsChecked == True
         self.window.Close()
 
     def show(self):
@@ -1320,6 +1375,7 @@ preview = PreviewWindow()
 if not preview.show():
     script.exit()
 copy_watts = preview.copy_watts
+align_existing = getattr(preview, "align_existing", False)
 
 
 # -----------------------------------------------------------------------------
@@ -1364,7 +1420,20 @@ def write_source_comments(instance, item):
         ))
 
 
-transaction = Transaction(doc, "Place 2D lighting symbols from link")
+aligned = []          # [linked type, linked id, symbol link, moved in plan mm, moved in Z mm]
+
+
+def connected_circuit_ids(instance):
+    """Ids of the electrical circuits the element belongs to (empty for 2D symbols)."""
+    try:
+        model = instance.MEPModel
+        systems = model.GetElectricalSystems() if model is not None else None
+        return set(id_value(system.Id) for system in systems) if systems else set()
+    except Exception:
+        return set()
+
+
+transaction = Transaction(doc, "Place / align 2D lighting symbols from link")
 handling = transaction.GetFailureHandlingOptions()
 handling.SetFailuresPreprocessor(WarningSwallower())
 transaction.SetFailureHandlingOptions(handling)
@@ -1394,6 +1463,31 @@ try:
         if not symbol.IsActive:
             symbol.Activate()
     doc.Regenerate()
+
+    # align existing symbols within 350 mm: MOVE only (no type / parameter changes)
+    for item in (to_align if align_existing else []):
+        source_label = u"{} : {}".format(*item.key)
+        instance = item.existing_instance
+        sub = SubTransaction(doc)
+        sub.Start()
+        try:
+            circuits_before = connected_circuit_ids(instance)
+            start = instance.Location.Point
+            target = align_target(item)
+            ElementTransformUtils.MoveElement(doc, instance.Id, target - start)
+            doc.Regenerate()
+            end = instance.Location.Point
+            if point_distance(end, target, True) > ALIGN_TOLERANCE:
+                raise Exception("Revit did not move it onto the linked fixture (hosted / constrained?)")
+            if connected_circuit_ids(instance) != circuits_before:
+                raise Exception("the move would change its circuit - left where it was")
+            sub.Commit()
+            aligned.append([source_label, id_value(item.fixture.Id), output.linkify(instance.Id),
+                            int(round(point_distance(start, end, True) * 304.8)),
+                            int(round((end.Z - start.Z) * 304.8))])
+        except Exception as error:
+            sub.RollBack()
+            failed.append([source_label, id_value(item.fixture.Id), u"align: {}".format(error)])
 
     for item in to_place:
         symbol = symbol_for.get(item.key)
@@ -1430,7 +1524,7 @@ try:
             sub.RollBack()
             failed.append([source_label, id_value(item.fixture.Id), str(error)])
 
-    if placed == 0 and not created_types:
+    if placed == 0 and not aligned and not created_types:
         transaction.RollBack()
     else:
         transaction.Commit()
@@ -1452,12 +1546,11 @@ output.print_table(table_data=[[r["linked"], r["qty"], r["target"], r["match"], 
 if placed_per_type:
     output.print_table(table_data=[[n, c] for n, c in sorted(placed_per_type.items())],
                        columns=["2D type", "Placed"], title="New symbols placed per type")
-if already:
+if aligned:
     output.print_table(
-        table_data=[[u"{} : {}".format(*i.key), id_value(i.fixture.Id), output.linkify(i.existing_id),
-                     int(round(getattr(i, "existing_distance", 0.0) * 304.8))] for i in already][:500],
-        columns=["Linked type", "Linked ID", "Existing symbol (click)", "Distance (mm)"],
-        title=u"Already existing within 350 mm - untouched ({})".format(len(already)))
+        table_data=aligned[:500],
+        columns=["Linked type", "Linked ID", "Existing symbol (click)", "Moved in plan (mm)", "Moved in height (mm)"],
+        title=u"Existing symbols aligned to the linked fixture ({})".format(len(aligned)))
 if created_types:
     output.print_table(table_data=[[n] for n in created_types], columns=["New type"], title="New types created")
 if conflicts:
@@ -1474,8 +1567,10 @@ if elevation_problems:
 summary = [
     u"{} symbol(s) placed.".format(placed),
     u"{} new type(s) created.".format(len(created_types)),
-    u"{} already had a symbol within 350 mm - left untouched.".format(len(already)),
-    u"Existing fixtures, wiring and circuits were NOT changed.",
+    u"{} existing symbol(s) within 350 mm aligned to the linked fixture{}.".format(
+        len(aligned), u"" if align_existing or not to_align else u" (aligning was switched off)"),
+    u"{} existing symbol(s) were already on the linked fixture.".format(len(already)),
+    u"Aligned symbols were only moved: type, parameters and circuits unchanged.",
 ]
 if outside:
     summary.append(u"{} skipped: outside the selected levels.".format(len(outside)))
