@@ -18,7 +18,7 @@ __doc__ = (
 #                    existing type name (spaces, dashes, case and word order
 #                    ignored); no match -> a new type in the selected family
 #     * position   : linked fixture insertion point, transformed to host coords
-#     * existing   : if ANY symbol (chosen 2D family or a host lighting fixture)
+#     * existing   : if a symbol of the chosen 2D family (or one this tool placed)
 #                    is within 350 mm of the linked fixture on the same floor,
 #                    it counts as existing and is ALIGNED onto the linked
 #                    fixture (moved only: no type change, no parameters; the
@@ -857,11 +857,14 @@ for item in items:
         )
 
 # -----------------------------------------------------------------------------
-# Existing symbols: anything within 350 mm (plan, same floor) of a linked
-# fixture counts as "already exists" and is LEFT UNTOUCHED - not moved, not
-# retyped, no parameters written, no circuit or wire changes.
-# Checked: every instance of the chosen 2D family (any view) and every host
-# Lighting Fixture (any family). A symbol covers only ONE linked fixture.
+# Existing symbols: a 2D symbol within 350 mm (plan, same floor) of a linked
+# fixture is that fixture's symbol. It is ALIGNED onto the fixture in plan
+# (X / Y only - height, type, parameters and circuits unchanged). Fixtures
+# with no symbol within 350 mm (new or missing) get a new symbol.
+# Counted as a symbol: every instance of the chosen 2D family, plus symbols
+# this tool placed earlier (Comments) in any family. Other host lighting
+# fixtures (3D fixtures, other families) are IGNORED - they used to block new
+# symbols and could even be moved. A symbol covers only ONE linked fixture.
 # -----------------------------------------------------------------------------
 EXISTING_RADIUS = 350.0 / 304.8          # 350 mm in feet
 
@@ -875,11 +878,10 @@ for instance in FilteredElementCollector(doc).OfClass(FamilyInstance):
         if instance.SuperComponent is not None:
             continue                       # nested part of another family
         in_family = symbol.Family is not None and symbol.Family.Id == family.Id
-        is_light = instance.Category is not None and id_value(instance.Category.Id) == lighting_category
-        if not (in_family or is_light):
-            continue
-        owner_view_id = instance.OwnerViewId
         source_link_id, source_fixture_id = source_reference_from_comments(instance)
+        if not (in_family or source_fixture_id is not None):
+            continue                       # not a 2D symbol of ours
+        owner_view_id = instance.OwnerViewId
         existing.append((instance.Location.Point, instance, owner_view_id,
                          source_link_id, source_fixture_id))
     except Exception:
@@ -1000,30 +1002,15 @@ def align_target(item):
     return XYZ(item.point.X, item.point.Y, current.Z)
 
 
-# Existing MODEL symbols that the active plan view does not show (typically
-# moved to the wrong height by an earlier run) still count for their fixture -
-# so no duplicate is added - but get their height repaired to the same height
-# a new symbol gets (which is visible).
+# Used only by the read-only check at the end (which symbols the open plan shows).
 visible_in_view = None
 view_level_id = None
 try:
     if isinstance(active_view, ViewPlan) and active_view.GenLevel is not None:
         view_level_id = active_view.GenLevel.Id
-        visible_in_view = set(id_value(e.Id) for e in
-                              FilteredElementCollector(doc, active_view.Id).OfClass(FamilyInstance))
+        visible_in_view = True
 except Exception:
     visible_in_view = None
-
-
-def hidden_in_view(item):
-    if visible_in_view is None or view_based or item.target_level is None:
-        return False
-    if item.target_level.Id != view_level_id:
-        return False                      # can only judge the open plan's level
-    instance = item.existing_instance
-    if is_view_specific(instance) or is_face_hosted(instance):
-        return False
-    return id_value(instance.Id) not in visible_in_view
 
 
 # existing symbol within 350 mm but not exactly on the linked fixture -> "align"
@@ -1031,14 +1018,12 @@ for item in items:
     if item.status != "existing":
         continue
     try:
-        item.fix_height = hidden_in_view(item)
         current = item.existing_instance.Location.Point
         item.align_distance = point_distance(current, align_target(item), False)
-        if item.align_distance > ALIGN_TOLERANCE or item.fix_height:
+        if item.align_distance > ALIGN_TOLERANCE:
             item.status = "align"
     except Exception:
         pass
-hidden_fixed = []
 
 # -----------------------------------------------------------------------------
 # DIAGNOSE: linked fixtures picked before running (hover, Tab until the linked
@@ -1352,7 +1337,7 @@ class PreviewWindow(object):
         self.delete_box.Content = u"Delete existing symbols that have NO linked fixture"
         self.delete_box.IsChecked = False          # destructive: off unless you tick it
         self.other_box = CheckBox()
-        self.other_box.Content = u"Include other host lighting fixtures (not only '{}')".format(family.Name)
+        self.other_box.Content = u"Include symbols this tool placed in other families (not only '{}')".format(family.Name)
         self.other_box.IsChecked = False
         self.circuit_box = CheckBox()
         self.circuit_box.Content = u"Keep fixtures that are connected to a circuit (protects wiring)"
@@ -1681,7 +1666,7 @@ class PreviewWindow(object):
         rows = [("Family : Type", "Element ID", "Level", "Source", "Circuit")]
         for o in orphans[:1000]:
             rows.append((o.label, str(id_value(o.id)), o.level_name,
-                         family.Name if o.in_family else u"other lighting fixture",
+                         family.Name if o.in_family else u"other family (placed by this tool)",
                          u"connected" if o.circuits else u"-"))
         for row_index, values in enumerate(rows):
             definition = RowDefinition()
@@ -1819,11 +1804,6 @@ try:
             if point_distance(start, target, True) > ALIGN_TOLERANCE:
                 ElementTransformUtils.MoveElement(doc, instance.Id, target - start)
                 doc.Regenerate()
-            if getattr(item, "fix_height", False):
-                # hidden in this plan: give it the height a new symbol gets
-                fix_elevation(instance, model_z(item))
-                target = XYZ(target.X, target.Y, instance.Location.Point.Z)
-                hidden_fixed.append(item)
             if was_pinned:
                 try:
                     instance.Pinned = True
@@ -2018,9 +1998,6 @@ if not view_based:
                        u"so they are visible in plan.".format(len(zero_rows), int(MIN_SYMBOL_LIFT * 304.8)))
 if failed:
     summary.append(u"{} problem(s) - see the output window.".format(len(failed)))
-if hidden_fixed:
-    summary.append(u"{} existing symbol(s) were hidden in this plan (wrong height) - "
-                   u"moved back to the fixture height so they show again.".format(len(hidden_fixed)))
 if off_geometry_ids:
     summary.append(u"{} fixture(s) have their insertion point away from their geometry - "
                    u"symbols go to the fixture centre (older symbols beside them are aligned "
@@ -2088,8 +2065,8 @@ if groups_why:
         summary.append(u"- {} x {}  [{}{}]".format(
             len(group), reason, u", ".join(type_names[:4]), u", ..." if len(type_names) > 4 else u""))
     if any(u"NOT moved" in r for r in groups_why):
-        summary.append(u"  -> tick 'Align existing' in the preview (pinned symbols cannot move: unpin them), "
-                       u"or delete the stray symbol and run again.")
+        summary.append(u"  -> tick 'Align existing' in the preview, or see 'Not placed' in the output "
+                       u"window for why the move failed (grouped / constrained symbol).")
     output.print_table(
         table_data=[[u"{} : {}".format(*i.key), id_value(i.fixture.Id), reason,
                      output.linkify(getattr(i, "placed_id", None) or i.existing_id)
