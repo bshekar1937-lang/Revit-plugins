@@ -46,6 +46,7 @@ from Autodesk.Revit.DB import (
     StorageType, Transaction, XYZ
 )
 from Autodesk.Revit.DB.Electrical import ElectricalSystem
+from Autodesk.Revit.UI import ExternalEvent, IExternalEventHandler
 from pyrevit import forms, revit, script
 
 import clr
@@ -100,6 +101,15 @@ ROOM_ORDERS = (
     ("circuit", "In the order the devices are on the circuit"),
 )
 
+# What to do when the parameter already has something in it. "keep" is the
+# default on purpose: Load Name usually holds a real load description, and
+# losing it to a list of rooms is not a fair trade.
+EXISTING_MODES = (
+    ("keep", "Keep it, and leave that circuit alone"),
+    ("append", "Keep it, and add the rooms after it"),
+    ("replace", "Replace it with the rooms"),
+)
+
 SEPARATORS = (
     (", ", u"comma and space        LL MCCS ROOM, CORRIDOR"),
     (" / ", u"slash                  LL MCCS ROOM / CORRIDOR"),
@@ -116,7 +126,8 @@ DEFAULT_SETTINGS = {
     "order": "number",          # number / name / circuit
     "include_panel_room": "0",
     "show_counts": "0",
-    "overwrite": "1",
+    "existing": "keep",         # keep / append / replace
+    "joiner": " - ",            # between the old value and the rooms
     "use_links": "1",
     "use_spaces": "1",
     "no_room_text": "",         # written for a device with no room; blank omits
@@ -764,6 +775,7 @@ def joined_value(entries, values):
 # What would change
 # -----------------------------------------------------------------------------
 STATUS_WRITE = "write"
+STATUS_ADD = "add"
 STATUS_SAME = "same"
 STATUS_KEEP = "keep"
 STATUS_NO_ROOMS = "no_rooms"
@@ -772,6 +784,7 @@ STATUS_NO_PARAM = "no_param"
 
 STATUS_TEXT = {
     STATUS_WRITE: "will be written",
+    STATUS_ADD: "rooms added after what is there",
     STATUS_SAME: "already correct",
     STATUS_KEEP: "has a different value, kept",
     STATUS_NO_ROOMS: "no room found for any device",
@@ -780,10 +793,32 @@ STATUS_TEXT = {
 }
 
 
+def final_value(current, rooms_text, values):
+    """What actually goes in the parameter, and why.
+
+    Returns (value, status). Adding is idempotent: a value that already
+    carries the room text is left alone, so running the tool twice does not
+    stack the rooms up again."""
+    mode = values["existing"]
+    if not rooms_text:
+        return current, STATUS_NO_ROOMS
+    if not current:
+        return rooms_text, STATUS_WRITE
+    if current == rooms_text:
+        return current, STATUS_SAME
+    if mode == "replace":
+        return rooms_text, STATUS_WRITE
+    if mode == "append":
+        joiner = values["joiner"]
+        if current.endswith(rooms_text) or rooms_text in current:
+            return current, STATUS_SAME     # the rooms are already in there
+        return current + joiner + rooms_text, STATUS_ADD
+    return current, STATUS_KEEP
+
+
 def build_changes(circuits, finder, values, progress=None):
     """One record per circuit: the rooms, the value, and what would happen."""
     parameter_name = values["parameter"]
-    overwrite = values["overwrite"]
     changes = []
     total = max(len(circuits), 1)
     for index, system in enumerate(circuits):
@@ -800,22 +835,19 @@ def build_changes(circuits, finder, values, progress=None):
                 panel_room = finder.find(base)
         entries, detail, missing = gather_rooms(
             devices, finder, values, panel_room)
-        wanted = joined_value(entries, values)
+        rooms_text = joined_value(entries, values)
 
         parameter = find_parameter(system, parameter_name, "instance")
         current = parameter_text(parameter) if parameter is not None else u""
+        wanted = rooms_text
         if parameter is None:
             status = STATUS_NO_PARAM
         elif not devices:
             status = STATUS_NO_DEVICES
         elif not entries:
             status = STATUS_NO_ROOMS
-        elif current == wanted:
-            status = STATUS_SAME
-        elif current and not overwrite:
-            status = STATUS_KEEP
         else:
-            status = STATUS_WRITE
+            wanted, status = final_value(current, rooms_text, values)
 
         changes.append({
             "system": system,
@@ -829,9 +861,10 @@ def build_changes(circuits, finder, values, progress=None):
             "entries": entries,
             "missing": missing,
             "current": current,
+            "rooms_text": rooms_text,
             "wanted": wanted,
             "status": status,
-            "include": status == STATUS_WRITE,
+            "include": status in (STATUS_WRITE, STATUS_ADD),
         })
     return changes
 
@@ -1029,11 +1062,23 @@ SETUP_XAML = """
             <ComboBox x:Name="cbParameter"
                       ToolTip="Only text parameters on the circuits that can be written are listed, with how many circuits have each one."/>
             <TextBlock x:Name="tbParameterHint" Style="{StaticResource Hint}"/>
-            <CheckBox x:Name="cbOverwrite" Margin="0,12,0,0"
-                      ToolTip="On: the rooms replace whatever is in the parameter. Off: a circuit that already has something is listed but left alone.">
-              <TextBlock Text="Replace values that are already there"
-                         FontWeight="SemiBold" Foreground="#334155"/>
-            </CheckBox>
+            <TextBlock Text="When the parameter already has something in it"
+                       Style="{StaticResource Label}" Margin="0,12,0,5"/>
+            <ComboBox x:Name="cbExisting"
+                      ToolTip="Load Name usually holds a real load description, so keeping it is the default. Adding puts the rooms after what is there, and running the tool again will not stack them up."/>
+            <Grid Margin="0,8,0,0">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="10"/>
+                <ColumnDefinition Width="110"/>
+              </Grid.ColumnDefinitions>
+              <TextBlock Grid.Column="0" Text="Added with"
+                         Style="{StaticResource Label}" Margin="0,0,0,0"
+                         VerticalAlignment="Center"/>
+              <TextBox x:Name="tbJoiner" Grid.Column="2" Height="28"
+                       ToolTip="What goes between the value that is there and the rooms, when adding."/>
+            </Grid>
+            <TextBlock x:Name="tbExistingHint" Style="{StaticResource Hint}"/>
             <CheckBox x:Name="cbLinks" Margin="0,8,0,0"
                       ToolTip="Rooms normally live in the linked architectural model, so this is usually needed.">
               <TextBlock Text="Look for rooms in linked models"
@@ -1187,7 +1232,13 @@ class SetupWindow(forms.WPFWindow):
             self.cbSelectionOnly.Checked += self.on_scope_changed
             self.cbSelectionOnly.Unchecked += self.on_scope_changed
 
-        self.cbOverwrite.IsChecked = settings["overwrite"] == "1"
+        for key, label in EXISTING_MODES:
+            self.cbExisting.Items.Add(label)
+        self.cbExisting.SelectedIndex = 0
+        for index, (key, _) in enumerate(EXISTING_MODES):
+            if key == settings["existing"]:
+                self.cbExisting.SelectedIndex = index
+        self.tbJoiner.Text = settings["joiner"]
         self.cbLinks.IsChecked = settings["use_links"] == "1"
         self.cbSpaces.IsChecked = settings["use_spaces"] == "1"
         self.cbCounts.IsChecked = settings["show_counts"] == "1"
@@ -1195,7 +1246,9 @@ class SetupWindow(forms.WPFWindow):
         self.tbNoRoom.Text = settings["no_room_text"]
         self.remembered_parameter = settings["parameter"]
 
+        self.cbExisting.SelectionChanged += self.on_existing_changed
         self.cbKind.SelectionChanged += self.on_scope_changed
+        self.cbParameter.SelectionChanged += self.on_parameter_changed
         for combo in (self.cbFormat, self.cbOrder, self.cbSeparator):
             combo.SelectionChanged += self.on_format_changed
         for box in (self.cbCounts, self.cbPanelRoom):
@@ -1208,6 +1261,7 @@ class SetupWindow(forms.WPFWindow):
         self.refresh_circuits()
         self.update_example()
         self.update_links_text()
+        self.on_existing_changed(None, None)
 
     # ----- reading the dialog -------------------------------------------------
     def current_kind(self):
@@ -1228,6 +1282,30 @@ class SetupWindow(forms.WPFWindow):
     def current_separator(self):
         index = self.cbSeparator.SelectedIndex
         return SEPARATORS[index][0] if 0 <= index < len(SEPARATORS) else ", "
+
+    def current_existing(self):
+        index = self.cbExisting.SelectedIndex
+        return EXISTING_MODES[index][0] if 0 <= index < len(EXISTING_MODES) \
+            else "keep"
+
+    def on_existing_changed(self, sender, args):
+        if not self.ready:
+            return
+        mode = self.current_existing()
+        self.tbJoiner.IsEnabled = mode == "append"
+        if mode == "keep":
+            self.tbExistingHint.Text = (
+                "Circuits that already have a value are listed and left "
+                "alone. Only empty ones are filled in.")
+        elif mode == "append":
+            self.tbExistingHint.Text = (
+                "The rooms go after what is there. A circuit whose value "
+                "already carries the rooms is left alone, so running this "
+                "again will not add them twice.")
+        else:
+            self.tbExistingHint.Text = (
+                "Whatever is in the parameter is overwritten. Careful with "
+                "Load Name: that is the circuit's own description.")
 
     def use_selection(self):
         return bool(self.panel_ids) and self.cbSelectionOnly.IsChecked == True
@@ -1278,10 +1356,24 @@ class SetupWindow(forms.WPFWindow):
             if "room" in name.lower():
                 chosen = index
         self.cbParameter.SelectedIndex = chosen
-        self.tbParameterHint.Text = (
-            "Only text parameters on the circuits that can be written are "
-            "listed."
-        )
+        self.update_parameter_hint()
+
+    def update_parameter_hint(self):
+        name = u""
+        index = self.cbParameter.SelectedIndex
+        if 0 <= index < len(self.parameter_names):
+            name = self.parameter_names[index]
+        if name.strip().lower() in ("load name", "circuit name"):
+            self.tbParameterHint.Text = (
+                "That is the circuit's own name, the one on the panel "
+                "schedule. Keeping or adding to what is there is usually "
+                "what you want, not replacing it."
+            )
+        else:
+            self.tbParameterHint.Text = (
+                "Only text parameters on the circuits that can be written "
+                "are listed."
+            )
 
     def update_links_text(self):
         count = 0
@@ -1327,6 +1419,10 @@ class SetupWindow(forms.WPFWindow):
     def on_scope_changed(self, sender, args):
         self.refresh_circuits()
 
+    def on_parameter_changed(self, sender, args):
+        if self.ready:
+            self.update_parameter_hint()
+
     def on_format_changed(self, sender, args):
         if self.ready:
             self.update_example()
@@ -1351,7 +1447,8 @@ class SetupWindow(forms.WPFWindow):
                 "system_kind": self.current_kind(),
                 "scope": "selection" if self.use_selection() else "all",
                 "circuits": self.circuits,
-                "overwrite": self.cbOverwrite.IsChecked == True,
+                "existing": self.current_existing(),
+                "joiner": self.tbJoiner.Text or " - ",
                 "use_links": self.cbLinks.IsChecked == True,
                 "use_spaces": self.cbSpaces.IsChecked == True,
             })
@@ -1375,11 +1472,58 @@ def values_to_settings(values):
         "order": values["order"],
         "include_panel_room": "1" if values["include_panel_room"] else "0",
         "show_counts": "1" if values["show_counts"] else "0",
-        "overwrite": "1" if values["overwrite"] else "0",
+        "existing": values["existing"],
+        "joiner": values["joiner"],
         "use_links": "1" if values["use_links"] else "0",
         "use_spaces": "1" if values["use_spaces"] else "0",
         "no_room_text": values["no_room_text"],
     }
+
+
+# =============================================================================
+# Doing Revit work from a panel that stays open
+# =============================================================================
+# The preview is modeless, so you can zoom to a circuit and then look at it
+# in Revit with the panel still up. The price is that a modeless window may
+# not touch the Revit API from its own event handlers: anything that reads
+# or changes the model has to be handed to Revit through an external event,
+# which Revit runs when it is ready, on its own thread, in a proper API
+# context. Everything below goes through run_in_revit().
+# =============================================================================
+class ApiAction(IExternalEventHandler):
+    """Runs one piece of work inside a valid Revit API context."""
+
+    def __init__(self):
+        self.job = None
+
+    def Execute(self, uiapp):
+        job = self.job
+        self.job = None
+        if job is None:
+            return
+        try:
+            job(uiapp)
+        except Exception as error:
+            # Never let an exception cross back into Revit's event loop.
+            try:
+                forms.alert(
+                    u"Something went wrong and nothing was changed:\n\n"
+                    u"{}".format(error), title=TITLE, warn_icon=True)
+            except Exception:
+                pass
+
+    def GetName(self):
+        return "Circuit Room Names action"
+
+
+API_ACTION = ApiAction()
+API_EVENT = ExternalEvent.Create(API_ACTION)
+
+
+def run_in_revit(job):
+    """Queue work for Revit. job(uiapp) runs when Revit is ready."""
+    API_ACTION.job = job
+    API_EVENT.Raise()
 
 
 # =============================================================================
@@ -1711,6 +1855,7 @@ RESULT_XAML = """
 STATUS_FILTERS = (
     ("all", "Everything"),
     (STATUS_WRITE, "Only what will be written"),
+    (STATUS_ADD, "Only ones the rooms are added to"),
     (STATUS_KEEP, "Only values kept as they are"),
     (STATUS_SAME, "Only ones already correct"),
     (STATUS_NO_ROOMS, "Only ones with no room found"),
@@ -1721,6 +1866,7 @@ STATUS_FILTERS = (
 
 STATUS_STYLE = {
     STATUS_WRITE: ("RowCardWrite", "RowGood"),
+    STATUS_ADD: ("RowCardWrite", "RowGood"),
     STATUS_SAME: ("RowCard", "RowValue"),
     STATUS_KEEP: ("RowCardWarn", "RowWarn"),
     STATUS_NO_ROOMS: ("RowCardWarn", "RowWarn"),
@@ -1739,6 +1885,7 @@ class ResultWindow(forms.WPFWindow):
         self.finder = finder
         self.shown = []
         self.choice = "close"
+        self.written_total = 0
         self.exported = []
         self.ready = False
         try:
@@ -1789,13 +1936,15 @@ class ResultWindow(forms.WPFWindow):
         self.tbHeadline.Text = (
             "{} circuit(s) checked - {} to write, {} already correct"
             "{}. Nothing is written until you say so.".format(
-                len(self.changes), counts.get(STATUS_WRITE, 0),
+                len(self.changes),
+                counts.get(STATUS_WRITE, 0) + counts.get(STATUS_ADD, 0),
                 counts.get(STATUS_SAME, 0),
                 ", {} device(s) with no room".format(lost) if lost else ""
             )
         )
         self.tbOverview.Text = u"\n".join(self.report_lines())
-        self.btnWrite.IsEnabled = counts.get(STATUS_WRITE, 0) > 0
+        self.btnWrite.IsEnabled = (counts.get(STATUS_WRITE, 0)
+                                   + counts.get(STATUS_ADD, 0)) > 0
         self.show_rows()
         self.show_devices()
         self.update_banner()
@@ -1809,8 +1958,9 @@ class ResultWindow(forms.WPFWindow):
         ).get(values["name_format"], values["name_format"])
         lines = [
             u"Parameter written: {}".format(values["parameter"]),
-            u"Values already there are {}.".format(
-                u"replaced" if values["overwrite"] else u"kept"),
+            u"A value already there is {}.".format(
+                dict(EXISTING_MODES).get(values["existing"],
+                                         values["existing"]).lower()),
             u"Each room written as: {}".format(format_label),
             u"Rooms listed: {}".format(order_label),
             u"Joined with: {!r}".format(values["separator"]),
@@ -1927,7 +2077,7 @@ class ResultWindow(forms.WPFWindow):
         tick = CheckBox()
         tick.IsChecked = change["include"]
         tick.VerticalAlignment = VerticalAlignment.Center
-        tick.IsEnabled = change["status"] == STATUS_WRITE
+        tick.IsEnabled = change["status"] in (STATUS_WRITE, STATUS_ADD)
         tick.ToolTip = ("Write this one" if tick.IsEnabled
                         else STATUS_TEXT.get(change["status"], ""))
         tick.Click += self.tick_row_handler(change, tick)
@@ -1958,6 +2108,13 @@ class ResultWindow(forms.WPFWindow):
             old_text.Style = self.FindResource("RowMeta")
             old_text.Text = u"was: {}".format(change["current"])
             value.Children.Add(old_text)
+        if (change["status"] == STATUS_ADD
+                and change["rooms_text"]
+                and change["rooms_text"] != change["wanted"]):
+            added = TextBlock()
+            added.Style = self.FindResource("RowMeta")
+            added.Text = u"added: {}".format(change["rooms_text"])
+            value.Children.Add(added)
 
         status_text = TextBlock()
         status_text.Style = self.FindResource(text_style)
@@ -2100,30 +2257,42 @@ class ResultWindow(forms.WPFWindow):
     def tick_handler(self, state):
         def handler(sender, args):
             for change in (self.shown or self.changes):
-                if change["status"] == STATUS_WRITE:
+                if change["status"] in (STATUS_WRITE, STATUS_ADD):
                     change["include"] = state
             self.show_rows()
             self.update_banner()
         return handler
 
     def focus(self, elements, zoom, label):
-        try:
-            element_ids = List[ElementId]()
-            for element in elements:
-                element_ids.Add(element.Id)
-            if element_ids.Count == 0:
+        """Select and zoom in Revit, leaving this panel open."""
+        ids = []
+        for element in elements:
+            try:
+                ids.append(element.Id)
+            except Exception:
+                pass
+        if not ids:
+            self.update_banner(
+                u"{} has nothing to select.".format(label), False)
+            return
+
+        def job(uiapp):
+            try:
+                document = uiapp.ActiveUIDocument
+                element_ids = List[ElementId]()
+                for item in ids:
+                    element_ids.Add(item)
+                document.Selection.SetElementIds(element_ids)
+                if zoom:
+                    document.ShowElements(element_ids)
                 self.update_banner(
-                    u"{} has nothing to select.".format(label), False)
-                return
-            uidoc.Selection.SetElementIds(element_ids)
-            if zoom:
-                uidoc.ShowElements(element_ids)
-            self.update_banner(
-                u"{} selected in Revit - move or close this window to look "
-                u"at it.".format(label), True)
-        except Exception as error:
-            self.update_banner(
-                u"Revit could not show it: {}".format(error), False)
+                    u"{} selected in Revit. This panel stays open - look at "
+                    u"it, then carry on here.".format(label), True)
+            except Exception as error:
+                self.update_banner(
+                    u"Revit could not show it: {}".format(error), False)
+
+        run_in_revit(job)
 
     def focus_handler(self, change, zoom):
         def handler(sender, args):
@@ -2225,11 +2394,48 @@ class ResultWindow(forms.WPFWindow):
             u"other: {}".format(len(rows), len(device_rows), path), True)
 
     def on_write(self, sender, args):
-        if not self.ticked():
+        """Write the ticked circuits, without closing the panel."""
+        ticked = self.ticked()
+        if not ticked:
             self.update_banner("Tick at least one circuit to write.", False)
             return
-        self.choice = "write"
-        self.Close()
+        self.btnWrite.IsEnabled = False
+        self.update_banner(
+            u"Writing {} circuit(s)...".format(len(ticked)), True)
+
+        def job(uiapp):
+            document = uiapp.ActiveUIDocument.Document
+            summary = write_values(ticked, self.values, document)
+            self.after_write(ticked, summary)
+
+        run_in_revit(job)
+
+    def after_write(self, written, summary):
+        """Fold the result back into the table, with the panel still open."""
+        if not summary["committed"]:
+            self.btnWrite.IsEnabled = True
+            self.update_banner(
+                u"Nothing was written: {}".format(summary["failure"]), False)
+            return
+        for change in written:
+            if change["status"] in (STATUS_WRITE, STATUS_ADD):
+                change["current"] = change["wanted"]
+                change["status"] = STATUS_SAME
+                change["include"] = False
+        self.written_total += summary["written"]
+        self.refresh()
+        message = u"{} circuit(s) written - a single Undo in Revit takes it " \
+                  u"back. The panel is still open.".format(
+                      summary["written"])
+        if summary["failures"]:
+            message += u" {} could not be written; first: {}".format(
+                len(summary["failures"]), summary["failures"][0])
+        self.update_banner(message, not summary["failures"])
+        try:
+            output.print_md("**Written:** {} circuit(s).".format(
+                summary["written"]))
+        except Exception:
+            pass
 
     def on_close(self, sender, args):
         self.choice = "close"
@@ -2286,17 +2492,34 @@ def ask_export_path():
 # =============================================================================
 # Writing the values (the only part that changes the model)
 # =============================================================================
-def write_values(changes, values):
-    """Set the parameter on the ticked circuits, all in one transaction."""
+def write_values(changes, values, document=None):
+    """Set the parameter on the ticked circuits, all in one transaction.
+
+    The circuits are looked up again by id: the panel stays open, so the
+    model may have moved on since the check was run."""
+    if document is None:
+        document = doc
     summary = {"written": 0, "failures": [], "committed": False,
                "failure": ""}
     parameter_name = values["parameter"]
-    transaction = Transaction(doc, "Circuit room names")
+    transaction = Transaction(document, "Circuit room names")
     transaction.Start()
     try:
         for change in changes:
+            system = change["system"]
+            try:
+                fresh = document.GetElement(to_element_id(change["id"]))
+                if fresh is not None:
+                    system = fresh
+            except Exception:
+                pass
+            if system is None:
+                summary["failures"].append(
+                    u"{}: the circuit is no longer in the model".format(
+                        change["label"]))
+                continue
             parameter = find_parameter(
-                change["system"], parameter_name, "instance")
+                system, parameter_name, "instance")
             if parameter is None:
                 summary["failures"].append(
                     u"{}: the parameter is no longer there".format(
@@ -2388,22 +2611,7 @@ finally:
 if not changes:
     forms.alert("No circuits were checked.", title=TITLE, exitscript=True)
 
-# ---- 4. show it, then write if asked ----------------------------------------
-window = ResultWindow(changes, values, finder)
-window.ShowDialog()
-
-summary = None
-if window.choice == "write":
-    summary = write_values(
-        [change for change in changes if change["include"]], values)
-    if not summary["committed"]:
-        forms.alert(
-            "The values could not be written and nothing was changed:\n\n"
-            "{}".format(summary["failure"]),
-            title=TITLE, warn_icon=True
-        )
-
-# ---- 5. report ----------------------------------------------------------------
+# ---- 4. report ----------------------------------------------------------------
 counts = {}
 for change in changes:
     counts[change["status"]] = counts.get(change["status"], 0) + 1
@@ -2462,30 +2670,10 @@ if lost:
         if shown > 200:
             break
 
-message = [
-    "{} circuit(s) checked.".format(len(changes)),
-    "{} would be written, {} already correct.".format(
-        counts.get(STATUS_WRITE, 0), counts.get(STATUS_SAME, 0)),
-]
-if lost:
-    message.append(
-        "{} device(s) could not be placed in a room - see the Devices tab "
-        "and the output window.".format(lost))
-if summary is not None and summary["committed"]:
-    message.append("")
-    message.append("{} circuit(s) written.".format(summary["written"]))
-    if summary["failures"]:
-        message.append("{} could not be written. First: {}".format(
-            len(summary["failures"]), summary["failures"][0]))
-    message.append("One Undo takes it all back.")
-elif summary is None:
-    message.append("")
-    message.append("Nothing was written.")
-if window.exported:
-    message.append("")
-    message.append("Exported to:")
-    message.extend("  {}".format(path) for path in window.exported)
-message.append("")
-message.append("The full table is in the pyRevit output window.")
-
-forms.alert("\n".join(message), title=TITLE)
+# ---- 5. the panel, which stays open -------------------------------------------
+# Show(), not ShowDialog(): Revit carries on working underneath, so a circuit
+# can be zoomed to and looked at with the panel still up. Everything the
+# panel does to the model goes through the external event above. The module
+# level reference keeps the window alive once this script has finished.
+RESULT_PANEL = ResultWindow(changes, values, finder)
+RESULT_PANEL.Show()

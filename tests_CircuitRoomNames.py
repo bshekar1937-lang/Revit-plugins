@@ -84,7 +84,7 @@ def options(**extra):
     values = {"parameter": "Room Names", "name_format": "name",
               "separator": ", ", "order": "number", "show_counts": False,
               "include_panel_room": False, "no_room_text": "",
-              "overwrite": True}
+              "existing": "keep", "joiner": " - "}
     values.update(extra)
     return values
 
@@ -193,11 +193,11 @@ circuits = [
     System(id=15, number="Y9", panel="PDB-B2-B02-02", param=None,
            devices=[device(6, "f", CORRIDOR)]),
 ]
-changes = ns["build_changes"](circuits, Finder(), options(overwrite=False))
+changes = ns["build_changes"](circuits, Finder(), options())
 status = dict((c["number"], c["status"]) for c in changes)
 same("empty parameter is filled in", status["R5"], ns["STATUS_WRITE"])
 same("a value that is already right is left", status["R6"], ns["STATUS_SAME"])
-same("a hand-typed value is kept unless overwrite is on", status["R7"],
+same("a hand-typed value is kept by default", status["R7"],
      ns["STATUS_KEEP"])
 same("a circuit with nothing on it is reported", status["R8"],
      ns["STATUS_NO_DEVICES"])
@@ -207,13 +207,45 @@ same("a circuit without the parameter is reported", status["Y9"],
      ns["STATUS_NO_PARAM"])
 same("only the writable one is ticked",
      [c["number"] for c in changes if c["include"]], ["R5"])
+same("nothing is written over by default",
+     [c["number"] for c in changes
+      if c["status"] == ns["STATUS_KEEP"]], ["R7"])
 same("the label reads like the tag on the drawing", changes[0]["label"],
      u"R5 / PDB-B2-B02-01")
 
-overwritten = ns["build_changes"](circuits, Finder(), options(overwrite=True))
-same("with overwrite on, the hand-typed value is replaced",
-     dict((c["number"], c["status"]) for c in overwritten)["R7"],
+replaced = ns["build_changes"](circuits, Finder(),
+                               options(existing="replace"))
+by_number = dict((c["number"], c) for c in replaced)
+same("told to replace, the hand-typed value goes", by_number["R7"]["status"],
      ns["STATUS_WRITE"])
+same("and the rooms take its place", by_number["R7"]["wanted"],
+     u"LL MCCS ROOM")
+
+print()
+print("=== 9b. Adding the rooms to what is already there")
+added = ns["build_changes"](circuits, Finder(), options(existing="append"))
+by_number = dict((c["number"], c) for c in added)
+same("the existing text is kept and the rooms follow",
+     by_number["R7"]["wanted"], u"typed by hand - LL MCCS ROOM")
+same("and that counts as adding, not overwriting",
+     by_number["R7"]["status"], ns["STATUS_ADD"])
+same("an empty one just gets the rooms", by_number["R5"]["wanted"],
+     u"LL MCCS ROOM, CORRIDOR")
+same("one that already matches is left alone", by_number["R6"]["status"],
+     ns["STATUS_SAME"])
+
+# Running it a second time must not stack the rooms up again.
+again = [System(id=12, number="R7", panel="PDB-B2-B02-01",
+                param=u"typed by hand - LL MCCS ROOM",
+                devices=[device(4, "d", MCCS)])]
+twice = ns["build_changes"](again, Finder(), options(existing="append"))
+same("running it again adds nothing", twice[0]["status"], ns["STATUS_SAME"])
+same("and leaves the value exactly as it was", twice[0]["wanted"],
+     u"typed by hand - LL MCCS ROOM")
+
+# The rooms are also kept separately, so the preview can show what was added.
+same("the room list is kept apart from the final value",
+     by_number["R7"]["rooms_text"], u"LL MCCS ROOM")
 
 print()
 print("=== 10. Only power circuits, unless asked for all")
