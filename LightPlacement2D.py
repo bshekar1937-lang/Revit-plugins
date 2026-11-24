@@ -406,6 +406,18 @@ def place_in_model(link, transform, fixture, symbol, point, levels,
     errors = []
     level = assigned_level or level_for(point.Z, levels)
 
+    # a0) work plane / face based families: host on the HOST level's plane.
+    #     Works for every linked fixture (also those hosted on a level or a
+    #     work plane in the link, which have no face to host on) and does not
+    #     depend on the linked ceiling, so it survives link reloads.
+    if level and symbol.Family.FamilyPlacementType == FamilyPlacementType.WorkPlaneBased:
+        try:
+            return doc.Create.NewFamilyInstance(level.GetPlaneReference(),
+                                                XYZ(point.X, point.Y, level.Elevation),
+                                                XYZ.BasisX, symbol)
+        except Exception as error:
+            errors.append(str(error))
+
     # a) unhosted / level-based / work-plane-based families
     if level and symbol.Family.FamilyPlacementType != FamilyPlacementType.OneLevelBasedHosted:
         try:
@@ -617,14 +629,51 @@ def family_fit(item):
     return matched + bonus
 
 
+# What each family placement type means for this tool (checked when chosen)
+PLACEMENT_INFO = {
+    "OneLevelBased": (True, u"unhosted", u"placed at each linked fixture"),
+    "TwoLevelsBased": (True, u"level based", u"placed at each linked fixture"),
+    "WorkPlaneBased": (True, u"work plane / face based",
+                       u"placed on the host level's plane at each linked fixture"),
+    "ViewBased": (True, u"annotation / detail item",
+                  u"placed in a plan view of each level at each linked fixture"),
+    "OneLevelBasedHosted": (False, u"wall / ceiling / floor HOSTED",
+                            u"needs a host element in THIS model at every fixture (linked "
+                            u"ceilings / walls cannot host it)"),
+    "CurveBased": (False, u"line based", u"needs a line, not a point"),
+    "CurveBasedDetail": (False, u"line based detail", u"needs a line, not a point"),
+    "CurveDrivenStructural": (False, u"structural framing", u"needs a line, not a point"),
+    "Adaptive": (False, u"adaptive", u"needs adaptive points"),
+}
+
+
+def family_check(candidate):
+    try:
+        placement = str(candidate.FamilyPlacementType)
+    except Exception:
+        placement = "Invalid"
+    return PLACEMENT_INFO.get(placement, (False, placement, u"this placement type is not supported"))
+
+
 ranked = sorted(families, key=family_fit, reverse=True)
-picked = forms.SelectFromList.show(
-    [Option(u"{}:  {}".format(f[2], f[0].Name), f) for f in ranked],
-    name_attr="name",
-    title="Choose ONE family. Missing linked types will be created in this family.",
-    button_name="Use this family")
-if not picked:
-    script.exit()
+while True:
+    picked = forms.SelectFromList.show(
+        [Option(u"{}:  {}      [{}{}]".format(
+            f[2], f[0].Name, family_check(f[0])[1], u"" if family_check(f[0])[0] else u" - cannot be used"), f)
+         for f in ranked],
+        name_attr="name",
+        title="Choose ONE family. Missing linked types will be created in this family.",
+        button_name="Use this family")
+    if not picked:
+        script.exit()
+    usable, placement_kind, placement_text = family_check(picked.value[0])
+    if usable:
+        break
+    forms.alert(u"'{}' is a {} family: it {}.\n\nChoose an unhosted, work plane / face based or "
+                u"annotation 2D family so a symbol can be placed at EVERY linked fixture."
+                .format(picked.value[0].Name, placement_kind, placement_text),
+                title="Light Placement 2D - family check")
+family_placement_note = u"{} - {}".format(placement_kind, placement_text)
 chosen_family = picked.value
 family, family_symbols, _ = chosen_family
 
@@ -1772,8 +1821,8 @@ class PreviewWindow(object):
         header.Background = gradient
         header.Children.Add(text_block("LIGHT PLACEMENT 2D", 20, True, "#FFFFFF", Thickness(18, 12, 18, 0)))
         header.Children.Add(text_block(
-            u"Link: {}   |   2D family: {}   |   Level(s): {}".format(
-                linked_doc.Title, family.Name, u", ".join(selected_level_names)),
+            u"Link: {}   |   2D family: {} ({})   |   Level(s): {}".format(
+                linked_doc.Title, family.Name, family_placement_note, u", ".join(selected_level_names)),
             12, False, "#BFDBFE", Thickness(18, 2, 18, 8)))
         cards = WrapPanel()
         cards.Margin = Thickness(18, 0, 18, 12)
@@ -2616,8 +2665,7 @@ class PreviewWindow(object):
     def build_overview(self):
         lines = [
             u"Link: {}".format(linked_doc.Title),
-            u"Family: {}   ({})".format(family.Name, "view-specific: placed in a plan view for each level"
-                                        if view_based else "model family: placed at fixture height"),
+            u"Family: {}   ({})".format(family.Name, family_placement_note),
             u"Selected level(s): {}".format(u", ".join(selected_level_names)),
             u"Level counts use the linked fixtures' Revit level assignment; "
             u"the host level is shown after the arrow.",
@@ -2934,7 +2982,7 @@ try:
         def rotate_step():
             location = instance.Location
             if rotate and abs(item.rotation) > 1e-6 and isinstance(location, LocationPoint) \
-                    and not is_face_hosted(instance):
+                    and not is_tilted(instance):
                 origin = location.Point
                 ElementTransformUtils.RotateElement(
                     doc, instance.Id, Line.CreateBound(origin, origin + XYZ.BasisZ), item.rotation)
