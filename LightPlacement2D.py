@@ -917,19 +917,31 @@ for item in items:
 
 used_existing = set()
 
-# 1) symbols this tool placed earlier carry the linked ID in Comments
+# 1) symbols this tool placed earlier carry the linked ID in Comments.
+#    Copy-pasted symbols carry the SAME Comments, so the ID is only trusted
+#    for the NEAREST such symbol, and only when it is close to the fixture
+#    (otherwise copies far away were dragged across the plan onto it).
+COMMENT_MATCH_RADIUS = 1500.0 / 304.8     # 1.5 m in feet
 by_fixture_id = dict((id_value(i.fixture.Id), i) for i in eligible)
+comment_candidates = {}
 for record in existing:
     source_link_id, source_fixture_id = record[3], record[4]
     if source_fixture_id is None or (source_link_id is not None and source_link_id != id_value(link.Id)):
         continue
     item = by_fixture_id.get(source_fixture_id)
-    if item is not None and item.existing_id is None:
-        item.existing_instance, item.existing_id = record[1], record[1].Id
-        item.existing_distance = point_distance(record[0], item.point, True)
-        item.existing_how = u"Comments say it was placed for this fixture"
-        item.status = "existing"
-        used_existing.add(id_value(record[1].Id))
+    if item is None:
+        continue
+    distance = point_distance(record[0], item.point, True)
+    if distance <= COMMENT_MATCH_RADIUS and on_item_floor(record, item):
+        comment_candidates.setdefault(source_fixture_id, []).append((distance, record))
+for source_fixture_id, candidates in comment_candidates.items():
+    item = by_fixture_id[source_fixture_id]
+    distance, record = min(candidates, key=lambda c: c[0])
+    item.existing_instance, item.existing_id = record[1], record[1].Id
+    item.existing_distance = distance
+    item.existing_how = u"Comments say it was placed for this fixture"
+    item.status = "existing"
+    used_existing.add(id_value(record[1].Id))
 
 # 2) any other symbol within 350 mm (nearest pairs first, one-to-one)
 cell = EXISTING_RADIUS
@@ -981,13 +993,11 @@ def is_view_specific(instance):
 
 
 def align_target(item):
-    """Where the existing symbol must go: linked fixture X/Y, and its Z too for
-    model elements that are not hosted on a face (a hosted one keeps its host)."""
-    instance = item.existing_instance
-    current = instance.Location.Point
-    if is_view_specific(instance) or is_face_hosted(instance):
-        return XYZ(item.point.X, item.point.Y, current.Z)
-    return model_point(item)
+    """Where an EXISTING symbol must go: the linked fixture's X / Y only.
+    Its height is never changed - moving existing symbols up to the fixture's
+    height pushed them out of the plan view range and they vanished."""
+    current = item.existing_instance.Location.Point
+    return XYZ(item.point.X, item.point.Y, current.Z)
 
 
 # existing symbol within 350 mm but not exactly on the linked fixture -> "align"
@@ -1761,6 +1771,10 @@ try:
     for item in (to_align if align_existing else []):
         source_label = u"{} : {}".format(*item.key)
         instance = item.existing_instance
+        if point_distance(instance.Location.Point, item.point, True) > COMMENT_MATCH_RADIUS:
+            failed.append([source_label, id_value(item.fixture.Id),
+                           u"align skipped: symbol is more than 1.5 m away - left where it was"])
+            continue
         sub = SubTransaction(doc)
         sub.Start()
         try:
