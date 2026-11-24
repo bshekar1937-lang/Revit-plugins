@@ -74,6 +74,8 @@ from Autodesk.Revit.DB import (
     SpecTypeId,
     UnitTypeId,
     UnitUtils,
+    WorksetId,
+    PlanViewPlane,
 )
 from Autodesk.Revit.DB.Structure import StructuralType
 from pyrevit import EXEC_PARAMS, forms, script
@@ -142,11 +144,22 @@ def unique_name(wanted, used_lower):
     return name
 
 
+def elev(level):
+    """Height of a level in MODEL coordinates (internal origin) - the same
+    system as every element position. Level.Elevation is measured from the
+    project base point / survey point (per level type), so comparing it with
+    element Z put symbols metres off (e.g. far above the plan's view range)."""
+    try:
+        return level.ProjectElevation
+    except Exception:
+        return level.Elevation
+
+
 def level_for(z, levels):
     """Highest level at or below z (the fixture's own floor); else the lowest."""
     if not levels:
         return None
-    below = [level for level in levels if level.Elevation <= z + LEVEL_TOLERANCE]
+    below = [level for level in levels if elev(level) <= z + LEVEL_TOLERANCE]
     return below[-1] if below else levels[0]
 
 
@@ -186,12 +199,12 @@ def host_level_for(link_level, link_transform, host_levels):
     if link_level is None or not host_levels:
         return None
     host_elevation = link_transform.OfPoint(
-        XYZ(0.0, 0.0, link_level.Elevation)
+        XYZ(0.0, 0.0, elev(link_level))
     ).Z
     same_name = [level for level in host_levels
                  if same(level.Name, link_level.Name)]
     candidates = same_name or host_levels
-    return min(candidates, key=lambda level: abs(level.Elevation - host_elevation))
+    return min(candidates, key=lambda level: abs(elev(level) - host_elevation))
 
 
 def point_distance(a, b, plan_only):
@@ -226,16 +239,25 @@ def source_reference_from_comments(instance):
 
 def target_point(item, view_based):
     if view_based and item.target_level is not None:
-        return XYZ(item.point.X, item.point.Y, item.target_level.Elevation)
+        return XYZ(item.point.X, item.point.Y, elev(item.target_level))
     return item.point
 
 
+REFERENCE_HEIGHT = {}     # host level id -> height above level of the symbols the plan SHOWS
+
+
 def model_z(item):
-    """Height a MODEL symbol is placed at: the linked fixture's elevation, but
-    never on / below its host level (zero-elevation fixtures)."""
+    """Height a MODEL symbol is placed at. On a level whose plan shows existing
+    symbols of the family: the same height above the level as those (so the new
+    ones show too). Otherwise the linked fixture's height, but never on / below
+    its level (zero-elevation fixtures)."""
+    if item.target_level is not None:
+        reference = REFERENCE_HEIGHT.get(id_value(item.target_level.Id))
+        if reference is not None:
+            return elev(item.target_level) + reference
     z = item.point.Z
     if item.target_level is not None:
-        z = max(z, item.target_level.Elevation + MIN_SYMBOL_LIFT)
+        z = max(z, elev(item.target_level) + MIN_SYMBOL_LIFT)
     return z
 
 
@@ -247,7 +269,7 @@ def height_above_level(item):
     """Linked fixture height above its host level in mm (None if unknown)."""
     if item.point is None or item.target_level is None:
         return None
-    return (item.point.Z - item.target_level.Elevation) * 304.8
+    return (item.point.Z - elev(item.target_level)) * 304.8
 
 
 def plan_view_for_level(view_id, level):
@@ -405,7 +427,7 @@ def place_in_model(link, transform, fixture, symbol, point, levels,
     if level and symbol.Family.FamilyPlacementType == FamilyPlacementType.WorkPlaneBased:
         try:
             return doc.Create.NewFamilyInstance(level.GetPlaneReference(),
-                                                XYZ(point.X, point.Y, level.Elevation),
+                                                XYZ(point.X, point.Y, elev(level)),
                                                 XYZ.BasisX, symbol)
         except Exception as error:
             errors.append(str(error))
@@ -419,7 +441,7 @@ def place_in_model(link, transform, fixture, symbol, point, levels,
             errors.append(str(error))
         try:
             # a2) same, on the level plane itself; the height is corrected afterwards
-            return doc.Create.NewFamilyInstance(XYZ(point.X, point.Y, level.Elevation), symbol,
+            return doc.Create.NewFamilyInstance(XYZ(point.X, point.Y, elev(level)), symbol,
                                                 level, StructuralType.NonStructural)
         except Exception as error:
             errors.append(str(error))
@@ -448,7 +470,7 @@ def place_in_model(link, transform, fixture, symbol, point, levels,
 
 
 def place_in_view(symbol, point, target_view, target_level):
-    elevation = target_level.Elevation if target_level is not None else point.Z
+    elevation = elev(target_level) if target_level is not None else point.Z
     return doc.Create.NewFamilyInstance(
         XYZ(point.X, point.Y, elevation), symbol, target_view
     )
@@ -824,10 +846,10 @@ def write_watts(parameter, watts, text):
 # -----------------------------------------------------------------------------
 # 6. Analyse every linked fixture (nothing changes yet)
 # -----------------------------------------------------------------------------
-levels = sorted(FilteredElementCollector(doc).OfClass(Level), key=lambda level: level.Elevation)
+levels = sorted(FilteredElementCollector(doc).OfClass(Level), key=lambda level: elev(level))
 link_levels = sorted(
     FilteredElementCollector(linked_doc).OfClass(Level),
-    key=lambda level: level.Elevation
+    key=lambda level: elev(level)
 )
 views_by_level = {}
 for plan_view in FilteredElementCollector(doc).OfClass(ViewPlan):
@@ -935,7 +957,7 @@ selected_level_names = sorted(
 FLOOR_BAND_BELOW = 0.6 * 1000.0 / 304.8
 STOREY_MIN_HEIGHT = 2.0 * 1000.0 / 304.8
 storey_levels = sorted([level for level in levels if id_value(level.Id) in views_by_level],
-                       key=lambda level: level.Elevation) or list(levels)
+                       key=lambda level: elev(level)) or list(levels)
 for item in items:
     item.in_selection = item.level is not None and id_value(item.level.Id) in selected_level_ids
     item.band_included = False
@@ -947,9 +969,9 @@ for item in items:
 
 
 def floor_band(level):
-    above = [s for s in storey_levels if s.Elevation >= level.Elevation + STOREY_MIN_HEIGHT]
-    top = above[0].Elevation - LEVEL_TOLERANCE if above else float("inf")
-    return level.Elevation - FLOOR_BAND_BELOW, top
+    above = [s for s in storey_levels if elev(s) >= elev(level) + STOREY_MIN_HEIGHT]
+    top = elev(above[0]) - LEVEL_TOLERANCE if above else float("inf")
+    return elev(level) - FLOOR_BAND_BELOW, top
 
 
 floor_bands = [(floor, floor_band(floor)) for floor in selected_floors]
@@ -1044,6 +1066,27 @@ def record_level_id(record):
     return id_value(level.Id) if level is not None else None
 
 
+def is_view_specific(instance):
+    try:
+        owner = instance.OwnerViewId
+        return owner is not None and owner != ElementId.InvalidElementId
+    except Exception:
+        return False
+
+
+def wrong_height(instance, level):
+    """A model symbol clearly outside its floor's height range (e.g. pushed up
+    by an earlier version) - plan views cannot show it."""
+    if level is None or is_view_specific(instance) or is_tilted(instance):
+        return False
+    try:
+        z = instance.Location.Point.Z
+    except Exception:
+        return False
+    low, high = floor_band(level)
+    return not (low <= z < high)
+
+
 # -----------------------------------------------------------------------------
 # Symbols the open plan does NOT show (wrong height, view filter, closed
 # workset, other phase / design option ...) must not count as "this fixture
@@ -1091,7 +1134,8 @@ try:
                 model_symbol = record[2] is None or record[2] == ElementId.InvalidElementId
                 if model_symbol and id_value(record[1].Id) not in shown_ids \
                         and record_level_id(record) == plan_level_id \
-                        and inside_crop(record[0]) and near_fixture(record[0]):
+                        and inside_crop(record[0]) and near_fixture(record[0]) \
+                        and not wrong_height(record[1], active_view.GenLevel):
                     hidden_records.append(record)
                 else:
                     kept.append(record)
@@ -1184,14 +1228,6 @@ def connected_circuit_ids(instance):
         return set()
 
 
-def is_view_specific(instance):
-    try:
-        owner = instance.OwnerViewId
-        return owner is not None and owner != ElementId.InvalidElementId
-    except Exception:
-        return False
-
-
 def align_target(item):
     """Where an EXISTING symbol must go: the linked fixture's X / Y only.
     Its height is never changed - moving existing symbols up to the fixture's
@@ -1211,17 +1247,20 @@ except Exception:
     visible_in_view = None
 
 
-# existing symbol within 350 mm but not exactly on the linked fixture -> "align"
+# existing symbol within 350 mm but not exactly on the linked fixture -> "align";
+# a symbol at a wrong height is aligned too (and put back at the right height)
 for item in items:
     if item.status != "existing":
         continue
     try:
         current = item.existing_instance.Location.Point
         item.align_distance = point_distance(current, align_target(item), False)
-        if item.align_distance > ALIGN_TOLERANCE:
+        item.fix_height = wrong_height(item.existing_instance, item.target_level)
+        if item.align_distance > ALIGN_TOLERANCE or item.fix_height:
             item.status = "align"
     except Exception:
         pass
+height_fixed = []
 
 # -----------------------------------------------------------------------------
 # DIAGNOSE: linked fixtures picked before running (hover, Tab until the linked
@@ -2173,7 +2212,7 @@ class PreviewWindow(object):
     def fill_levels(self):
         level_ids = set(m.level_id for m in self.markers if m.level_id is not None)
         ordered = sorted([lid for lid in level_ids if lid in self.levels_by_id],
-                         key=lambda lid: self.levels_by_id[lid].Elevation)
+                         key=lambda lid: elev(self.levels_by_id[lid]))
         self.level_keys = ["ALL"] + ordered
         entry = ComboBoxItem()
         entry.Content = u"All selected levels   ({})".format(len(self.markers))
@@ -2267,7 +2306,7 @@ class PreviewWindow(object):
                 if marker.level_id in self.levels_by_id:
                     by_level.setdefault(marker.level_id, []).append(marker)
             for lid, members in by_level.items():
-                z = self.levels_by_id[lid].Elevation
+                z = elev(self.levels_by_id[lid])
                 xmin, ymin, xmax, ymax = bounds_of(members, margin)
                 add_slab(slab, xmin, ymin, xmax, ymax, z - 0.8, z - 0.15)
         else:
@@ -2275,7 +2314,7 @@ class PreviewWindow(object):
             members = self.level_fixtures()
             if level is None or not members:
                 return None
-            z = level.Elevation
+            z = elev(level)
             xmin, ymin, xmax, ymax = bounds_of(members, margin)
             add_slab(slab, xmin, ymin, xmax, ymax, z - 0.8, z - 0.15)
             if with_walls:
@@ -2668,7 +2707,7 @@ class PreviewWindow(object):
 
         # grids with bubbles (on the level plane)
         if self.show_grids and level is not None:
-            z = level.Elevation
+            z = elev(level)
             for name, a, b in self.get_grids():
                 pa = project(a[0], a[1], z)
                 pb = project(b[0], b[1], z)
@@ -3008,6 +3047,47 @@ aligned = []          # [linked type, linked id, symbol link, moved in plan mm, 
 deleted = []          # [family : type, element id, level]
 
 
+# -----------------------------------------------------------------------------
+# Copy what makes the existing symbols VISIBLE in the open plan: their height
+# above the level (new symbols on that level get the same) and, if the active
+# workset is hidden in this view, their workset.
+# -----------------------------------------------------------------------------
+reference_workset = None
+reference_workset_name = None
+try:
+    if isinstance(active_view, ViewPlan) and active_view.GenLevel is not None and not view_based:
+        plan_level = active_view.GenLevel
+        shown_now = set(id_value(e.Id) for e in
+                        FilteredElementCollector(doc, active_view.Id).OfClass(FamilyInstance))
+        heights = {}
+        worksets = {}
+        for record in existing:
+            instance = record[1]
+            if id_value(instance.Id) not in shown_now or is_view_specific(instance) or is_tilted(instance):
+                continue
+            if instance.Symbol is None or instance.Symbol.Family.Id != family.Id:
+                continue
+            if record_level_id(record) != id_value(plan_level.Id):
+                continue
+            key = int(round((instance.Location.Point.Z - elev(plan_level)) * 304.8))
+            heights[key] = heights.get(key, 0) + 1
+            try:
+                worksets[instance.WorksetId.IntegerValue] = worksets.get(instance.WorksetId.IntegerValue, 0) + 1
+            except Exception:
+                pass
+        if heights:
+            REFERENCE_HEIGHT[id_value(plan_level.Id)] = max(heights.items(), key=lambda kv: kv[1])[0] / 304.8
+        if worksets and doc.IsWorkshared:
+            table = doc.GetWorksetTable()
+            if not active_view.IsWorksetVisible(table.GetActiveWorksetId()):
+                reference_workset = max(worksets.items(), key=lambda kv: kv[1])[0]
+                try:
+                    reference_workset_name = table.GetWorkset(WorksetId(reference_workset)).Name
+                except Exception:
+                    reference_workset_name = str(reference_workset)
+except Exception:
+    pass
+
 transaction = Transaction(doc, "Place / align 2D lighting symbols from link")
 handling = transaction.GetFailureHandlingOptions()
 handling.SetFailuresPreprocessor(WarningSwallower())
@@ -3072,6 +3152,9 @@ try:
             if point_distance(start, target, True) > ALIGN_TOLERANCE:
                 ElementTransformUtils.MoveElement(doc, instance.Id, target - start)
                 doc.Regenerate()
+            if getattr(item, "fix_height", False):
+                fix_elevation(instance, model_z(item))   # back to the right height on its floor
+                height_fixed.append(item)
             if was_pinned:
                 try:
                     instance.Pinned = True
@@ -3144,9 +3227,18 @@ try:
                 ElementTransformUtils.RotateElement(
                     doc, instance.Id, Line.CreateBound(origin, origin + XYZ.BasisZ), item.rotation)
 
+        def workset_step():
+            # the active workset is hidden in this plan: use the visible symbols' workset
+            if reference_workset is not None and instance.WorksetId.IntegerValue != reference_workset:
+                parameter = instance.get_Parameter(BuiltInParameter.ELEM_PARTITION_PARAM)
+                if parameter is not None and not parameter.IsReadOnly:
+                    parameter.Set(reference_workset)
+
         def position_step():
             # whatever the family's placement rules did: the symbol's insertion
-            # point must sit EXACTLY on the linked fixture in plan
+            # point must sit EXACTLY on the linked fixture in plan (measured
+            # after regeneration, so the reading is the real position)
+            doc.Regenerate()
             location = instance.Location
             if isinstance(location, LocationPoint):
                 current = location.Point
@@ -3157,12 +3249,12 @@ try:
                     position_fixed.add(fid)
 
         for step_name, step in (
-                (u"position", position_step),
                 (u"rotation", rotate_step),
                 (u"elevation", lambda: check_elevation(instance, item)),
+                (u"workset", workset_step),
                 (u"comments", lambda: write_source_comments(instance, item)),
                 (u"wattage", lambda: apply_watts(instance, item)),
-                (u"position check", position_step)):
+                (u"position", position_step)):
             try:
                 step()
             except Exception as error:
@@ -3321,7 +3413,7 @@ if skipped_rows:
         title=u"Linked fixtures that did NOT get a new symbol ({})".format(len(skipped_rows)))
 
 zero_rows = []
-for item in items:
+for item in selected_items:
     above = height_above_level(item)
     if above is not None and above < MIN_SYMBOL_LIFT * 304.8:
         zero_rows.append([u"{} : {}".format(*item.key), id_value(item.fixture.Id),
@@ -3375,11 +3467,21 @@ if not view_based:
         summary.append(u"{} symbol(s) could NOT be set to the linked elevation - see the output window."
                        .format(len(elevation_problems)))
     elif placed:
-        summary.append(u"Elevation checked: every NEW symbol is at the linked fixture's "
-                       u"elevation (within 1 mm).")
+        summary.append(u"Elevation checked: every NEW symbol is at its intended height (within 1 mm).")
+    for level_id, height in REFERENCE_HEIGHT.items():
+        level = doc.GetElement(ElementId(level_id)) if not isinstance(level_id, ElementId) else None
+        summary.append(u"New symbols on {} use the same height as the symbols this plan shows "
+                       u"({} mm above the level).".format(level.Name if level is not None else u"this level",
+                                                         int(round(height * 304.8))))
+    if height_fixed:
+        summary.append(u"{} existing symbol(s) were at a wrong height (outside their floor) and were put "
+                       u"back at the right height.".format(len(height_fixed)))
+    if reference_workset is not None:
+        summary.append(u"The active workset is hidden in this plan: new symbols were put on workset '{}' "
+                       u"(the one your visible symbols use).".format(reference_workset_name))
     if zero_rows:
-        summary.append(u"{} zero-elevation fixture(s): symbols placed {} mm above the level "
-                       u"so they are visible in plan.".format(len(zero_rows), int(MIN_SYMBOL_LIFT * 304.8)))
+        summary.append(u"{} fixture(s) sit at their level (0 mm): their symbols are kept at least {} mm "
+                       u"above it.".format(len(zero_rows), int(MIN_SYMBOL_LIFT * 304.8)))
 if failed:
     summary.append(u"{} problem(s) - see the output window.".format(len(failed)))
 if drawing_offsets:
@@ -3457,12 +3559,55 @@ try:
                 still_hidden.append(item)
 except Exception:
     still_hidden = []
-STILL_HIDDEN = u"its symbol exists but this plan view does NOT show it (view range / filter / workset)"
+def view_range_band():
+    """(view depth or bottom, cut plane) of the open plan in model coordinates."""
+    try:
+        view_range = active_view.GetViewRange()
+
+        def plane_z(plane):
+            level_id = view_range.GetLevelId(plane)
+            level = doc.GetElement(level_id) if level_id is not None and \
+                level_id != ElementId.InvalidElementId else None
+            return elev(level) + view_range.GetOffset(plane) if isinstance(level, Level) else None
+
+        low = plane_z(PlanViewPlane.ViewDepthPlane)
+        if low is None:
+            low = plane_z(PlanViewPlane.BottomClipPlane)
+        return low, plane_z(PlanViewPlane.CutPlane)
+    except Exception:
+        return None, None
+
+
+VIEW_LOW, VIEW_CUT = view_range_band()
+
+
+def hidden_cause(item):
+    """Why the plan does not show this item's symbol (short group text)."""
+    symbol_id = getattr(item, "placed_id", None) or item.existing_id
+    instance = doc.GetElement(symbol_id) if symbol_id is not None else None
+    if instance is None:
+        return u"its symbol exists but this plan does NOT show it"
+    try:
+        if doc.IsWorkshared and not active_view.IsWorksetVisible(instance.WorksetId):
+            name = doc.GetWorksetTable().GetWorkset(instance.WorksetId).Name
+            return u"its symbol is on workset '{}', which this view HIDES (Visibility/Graphics > " \
+                   u"Worksets)".format(name)
+    except Exception:
+        pass
+    try:
+        z = instance.Location.Point.Z
+        if VIEW_LOW is not None and z < VIEW_LOW - ELEVATION_TOLERANCE:
+            return u"its symbol is BELOW this plan's view range"
+        if VIEW_CUT is not None and z > VIEW_CUT + ELEVATION_TOLERANCE:
+            return u"its symbol is ABOVE this plan's cut plane"
+    except Exception:
+        pass
+    return u"its symbol exists but a view filter / visibility setting / phase hides it in this plan"
 
 
 groups_why = {}
 for item in still_hidden:
-    groups_why.setdefault(STILL_HIDDEN, []).append(item)
+    groups_why.setdefault(hidden_cause(item), []).append(item)
 for item in items:
     if item.status == "outside":
         continue
