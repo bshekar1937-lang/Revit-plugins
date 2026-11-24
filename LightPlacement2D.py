@@ -1000,17 +1000,45 @@ def align_target(item):
     return XYZ(item.point.X, item.point.Y, current.Z)
 
 
+# Existing MODEL symbols that the active plan view does not show (typically
+# moved to the wrong height by an earlier run) still count for their fixture -
+# so no duplicate is added - but get their height repaired to the same height
+# a new symbol gets (which is visible).
+visible_in_view = None
+view_level_id = None
+try:
+    if isinstance(active_view, ViewPlan) and active_view.GenLevel is not None:
+        view_level_id = active_view.GenLevel.Id
+        visible_in_view = set(id_value(e.Id) for e in
+                              FilteredElementCollector(doc, active_view.Id).OfClass(FamilyInstance))
+except Exception:
+    visible_in_view = None
+
+
+def hidden_in_view(item):
+    if visible_in_view is None or view_based or item.target_level is None:
+        return False
+    if item.target_level.Id != view_level_id:
+        return False                      # can only judge the open plan's level
+    instance = item.existing_instance
+    if is_view_specific(instance) or is_face_hosted(instance):
+        return False
+    return id_value(instance.Id) not in visible_in_view
+
+
 # existing symbol within 350 mm but not exactly on the linked fixture -> "align"
 for item in items:
     if item.status != "existing":
         continue
     try:
+        item.fix_height = hidden_in_view(item)
         current = item.existing_instance.Location.Point
         item.align_distance = point_distance(current, align_target(item), False)
-        if item.align_distance > ALIGN_TOLERANCE:
+        if item.align_distance > ALIGN_TOLERANCE or item.fix_height:
             item.status = "align"
     except Exception:
         pass
+hidden_fixed = []
 
 # -----------------------------------------------------------------------------
 # DIAGNOSE: linked fixtures picked before running (hover, Tab until the linked
@@ -1788,8 +1816,14 @@ try:
                     instance.Pinned = False      # pinned symbols cannot be moved
             except Exception:
                 pass
-            ElementTransformUtils.MoveElement(doc, instance.Id, target - start)
-            doc.Regenerate()
+            if point_distance(start, target, True) > ALIGN_TOLERANCE:
+                ElementTransformUtils.MoveElement(doc, instance.Id, target - start)
+                doc.Regenerate()
+            if getattr(item, "fix_height", False):
+                # hidden in this plan: give it the height a new symbol gets
+                fix_elevation(instance, model_z(item))
+                target = XYZ(target.X, target.Y, instance.Location.Point.Z)
+                hidden_fixed.append(item)
             if was_pinned:
                 try:
                     instance.Pinned = True
@@ -1851,6 +1885,7 @@ try:
             write_source_comments(instance, item)
             apply_watts(instance, item)
             sub.Commit()
+            item.placed_id = instance.Id
             placed += 1
             label = type_name(symbol)
             placed_per_type[label] = placed_per_type.get(label, 0) + 1
@@ -1983,6 +2018,9 @@ if not view_based:
                        u"so they are visible in plan.".format(len(zero_rows), int(MIN_SYMBOL_LIFT * 304.8)))
 if failed:
     summary.append(u"{} problem(s) - see the output window.".format(len(failed)))
+if hidden_fixed:
+    summary.append(u"{} existing symbol(s) were hidden in this plan (wrong height) - "
+                   u"moved back to the fixture height so they show again.".format(len(hidden_fixed)))
 if off_geometry_ids:
     summary.append(u"{} fixture(s) have their insertion point away from their geometry - "
                    u"symbols go to the fixture centre (older symbols beside them are aligned "
@@ -2016,12 +2054,31 @@ def reason_group(item):
     return None
 
 
+still_hidden = []
+try:
+    if visible_in_view is not None and not view_based:
+        visible_after = set(id_value(e.Id) for e in
+                            FilteredElementCollector(doc, active_view.Id).OfClass(FamilyInstance))
+        for item in items:
+            if item.target_level is None or item.target_level.Id != view_level_id:
+                continue
+            symbol_id = getattr(item, "placed_id", None) or item.existing_id
+            if symbol_id is not None and doc.GetElement(symbol_id) is not None \
+                    and id_value(symbol_id) not in visible_after:
+                still_hidden.append(item)
+except Exception:
+    still_hidden = []
+STILL_HIDDEN = u"its symbol exists but this plan view does NOT show it (view range / filter / workset)"
+
+
 groups_why = {}
+for item in still_hidden:
+    groups_why.setdefault(STILL_HIDDEN, []).append(item)
 for item in items:
     if item.status == "outside":
         continue
     reason = reason_group(item)
-    if reason:
+    if reason and item not in still_hidden:
         groups_why.setdefault(reason, []).append(item)
 if groups_why:
     summary.append(u"")
@@ -2035,7 +2092,8 @@ if groups_why:
                        u"or delete the stray symbol and run again.")
     output.print_table(
         table_data=[[u"{} : {}".format(*i.key), id_value(i.fixture.Id), reason,
-                     output.linkify(i.existing_id) if i.existing_id is not None else u"-"]
+                     output.linkify(getattr(i, "placed_id", None) or i.existing_id)
+                     if (getattr(i, "placed_id", None) or i.existing_id) is not None else u"-"]
                     for reason, group in groups_why.items() for i in group][:1000],
         columns=["Linked type", "Linked ID", "Why no symbol", "Symbol counted for it (click)"],
         title=u"Still without a symbol on the fixture ({})".format(sum(len(g) for g in groups_why.values())))
