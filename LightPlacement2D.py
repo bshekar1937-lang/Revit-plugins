@@ -1283,16 +1283,25 @@ clr.AddReference("PresentationCore")
 clr.AddReference("WindowsBase")
 from System.Windows import (Window, Thickness, GridLength, GridUnitType, FontWeights,
                             WindowStartupLocation, CornerRadius, TextWrapping,
-                            HorizontalAlignment, VerticalAlignment)
+                            HorizontalAlignment, VerticalAlignment, FrameworkElement,
+                            FlowDirection, Rect)
+from System.Windows import Point as WinPoint
 from System.Windows.Controls import (DockPanel, Dock, StackPanel, TextBlock, Button, Border,
                                      TabControl, TabItem, ScrollViewer, ScrollBarVisibility,
                                      Grid as WpfGrid, ColumnDefinition, RowDefinition,
-                                     Orientation, CheckBox, Viewport3D)
+                                     Orientation, CheckBox, Viewport3D, ComboBox, ComboBoxItem,
+                                     ListBox, ListBoxItem, TextBox, WrapPanel)
+from System.Windows.Input import MouseButton, Cursors
 from System.Windows.Interop import WindowInteropHelper
-from System.Windows.Media import (SolidColorBrush, Brushes, Color, ColorConverter, FontFamily)
+from System.Windows.Media import (SolidColorBrush, Brushes, Color, ColorConverter, FontFamily,
+                                  Pen, DashStyle, DoubleCollection, Typeface, FormattedText,
+                                  LinearGradientBrush)
 from System.Windows.Media.Media3D import (ModelVisual3D, Model3DGroup, GeometryModel3D,
                                           MeshGeometry3D, DiffuseMaterial, AmbientLight,
-                                          DirectionalLight, PerspectiveCamera, Point3D, Vector3D)
+                                          DirectionalLight, OrthographicCamera, Point3D, Vector3D)
+from System.Globalization import CultureInfo
+from Autodesk.Revit.DB import Wall, LocationCurve
+from Autodesk.Revit.DB import Grid as RvtGrid
 
 
 def brush(hex_color):
@@ -1326,41 +1335,346 @@ def text_block(text, size=12, bold=False, color="#334155", margin=None):
     return block
 
 
-STATUS_COLORS = {
-    "new_type": Color.FromRgb(245, 158, 11),     # amber  - will be placed with a NEW type
-    "existing_type": Color.FromRgb(34, 211, 238),  # cyan - will be placed with your type
-    "existing": Color.FromRgb(100, 116, 139),     # grey  - existing, already aligned
-    "align": Color.FromRgb(168, 85, 247),         # purple - existing within 350 mm, will be aligned
-    "orphan": Color.FromRgb(236, 72, 153),        # pink  - existing symbol with NO linked fixture
-    "outside": Color.FromRgb(239, 68, 68),        # red   - not selected or no plan view
+# -----------------------------------------------------------------------------
+# Preview: what happens to every linked fixture, drawn on the real building
+# (walls of the loaded links, grids) so it can be checked without Revit.
+# -----------------------------------------------------------------------------
+PREVIEW_STATUSES = (
+    ("place_type", u"New symbol - your type", (34, 197, 94)),
+    ("place_new", u"New symbol - NEW type", (245, 158, 11)),
+    ("align", u"Existing - will be aligned", (168, 85, 247)),
+    ("ok", u"Existing - already on fixture", (148, 163, 184)),
+    ("orphan", u"Existing - no linked fixture", (236, 72, 153)),
+    ("skipped", u"Cannot place", (239, 68, 68)),
+)
+STATUS_RGB = dict((k, c) for k, _, c in PREVIEW_STATUSES)
+STATUS_LABEL = dict((k, l) for k, l, _ in PREVIEW_STATUSES)
+STATUS_SHORT = {"place_type": u"NEW", "place_new": u"NEW TYPE", "align": u"ALIGN",
+                "ok": u"OK", "orphan": u"NO LINK", "skipped": u"SKIP"}
+DRAW_ORDER = {"ok": 0, "orphan": 1, "align": 2, "place_type": 3, "place_new": 4, "skipped": 5}
+LIST_ORDER = {"skipped": 0, "place_new": 1, "place_type": 2, "align": 3, "orphan": 4, "ok": 5}
+SKIP_TEXT = {
+    "noloc": u"no insertion point",
+    "no_level": u"no level found in the link",
+    "no_host_level": u"no matching level in this model",
+    "no_view": u"no plan view on the matching level",
 }
+FEET_PER_M = 1000.0 / 304.8
+WALL_CUT = 1.0 * FEET_PER_M          # walls are shown cut 1 m above the level, like a plan
 
 
-def item_color_key(item):
-    if item.status == "existing":
-        return "existing"
+def status_color(key, alpha=255):
+    r, g, b = STATUS_RGB[key]
+    return Color.FromArgb(alpha, r, g, b)
+
+
+def frozen_brush(color):
+    result = SolidColorBrush(color)
+    result.Freeze()
+    return result
+
+
+def frozen_pen(color, thickness, dashes=None):
+    pen = Pen(frozen_brush(color), thickness)
+    if dashes:
+        values = DoubleCollection()
+        for value in dashes:
+            values.Add(value)
+        pen.DashStyle = DashStyle(values, 0.0)
+    pen.Freeze()
+    return pen
+
+
+FILL = dict((key, frozen_brush(status_color(key))) for key in STATUS_RGB)
+OUTLINE_PEN = frozen_pen(Color.FromArgb(235, 2, 6, 23), 1.2)
+SELECT_PEN = frozen_pen(Color.FromRgb(255, 255, 255), 2.0)
+SELECT_HALO = frozen_pen(Color.FromArgb(90, 255, 255, 255), 5.0)
+ALIGN_PEN = frozen_pen(status_color("align"), 2.0)
+ALIGN_RING = frozen_pen(status_color("align"), 2.0)
+GRID_PEN = frozen_pen(Color.FromArgb(140, 248, 113, 113), 1.0, (10, 4, 2, 4))
+GRID_BUBBLE_PEN = frozen_pen(Color.FromArgb(220, 248, 113, 113), 1.2)
+ZONE_PEN = frozen_pen(Color.FromArgb(120, 203, 213, 225), 1.0, (3, 3))
+SCALE_PEN = frozen_pen(Color.FromRgb(226, 232, 240), 2.0)
+CARD_PEN = frozen_pen(Color.FromArgb(120, 148, 163, 184), 1.0)
+CARD_FILL = frozen_brush(Color.FromArgb(240, 15, 23, 42))
+BUBBLE_FILL = frozen_brush(Color.FromArgb(230, 15, 23, 42))
+TONES = {
+    "text": frozen_brush(Color.FromRgb(241, 245, 249)),
+    "muted": frozen_brush(Color.FromRgb(148, 163, 184)),
+    "label": frozen_brush(Color.FromRgb(203, 213, 225)),
+    "grid": frozen_brush(Color.FromRgb(252, 165, 165)),
+}
+TONES.update(FILL)
+TYPEFACE = Typeface("Segoe UI")
+TYPEFACE_BOLD = Typeface("Segoe UI Semibold")
+_text_cache = {}
+
+
+def formatted(text, size=11.0, tone="text", bold=False):
+    """Cached FormattedText for the overlay."""
+    key = (text, size, tone, bold)
+    value = _text_cache.get(key)
+    if value is None:
+        face = TYPEFACE_BOLD if bold else TYPEFACE
+        try:
+            value = FormattedText(text, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight,
+                                  face, size, TONES[tone], 1.0)
+        except Exception:
+            value = FormattedText(text, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight,
+                                  face, size, TONES[tone])
+        if len(_text_cache) < 6000:
+            _text_cache[key] = value
+    return value
+
+
+def preview_status(item):
+    if item.status in SKIP_TEXT:
+        return "skipped"
     if item.status == "align":
         return "align"
-    if item.status in ("outside", "noloc", "no_level", "no_host_level", "no_view"):
-        return "outside"
-    return "existing_type" if mapping[item.key][0] == "existing" else "new_type"
+    if item.status == "existing":
+        return "ok"
+    return "place_type" if mapping[item.key][0] == "existing" else "place_new"
+
+
+def planned_type_name(item):
+    kind, value = mapping[item.key]
+    return type_name(value) if kind == "existing" else value
+
+
+class PreviewMarker(object):
+    """One marker: a linked fixture (with what will happen to it) or a symbol with no fixture."""
+    def __init__(self, kind, point, item=None, orphan=None, symbol_point=None, label=u""):
+        self.kind = kind
+        self.x, self.y, self.z = point.X, point.Y, point.Z
+        self.item = item
+        self.orphan = orphan
+        self.sym = (symbol_point.X, symbol_point.Y, symbol_point.Z) if symbol_point is not None else None
+        self.label = label or u""
+        if item is not None:
+            self.level_id = id_value(item.target_level.Id) if item.target_level is not None else None
+            self.title = item.key[1]
+            self.ident = id_value(item.fixture.Id)
+            family_name = item.key[0]
+        else:
+            self.level_id = getattr(orphan, "level_id", None)
+            self.title = orphan.label
+            self.ident = id_value(orphan.id)
+            family_name = u""
+        self.search = u"{} {} {} {}".format(self.title, family_name, self.ident, self.label).lower()
+
+
+def build_markers():
+    markers = []
+    for item in selected_items:
+        if item.point is None:
+            continue
+        kind = preview_status(item)
+        symbol_point = None
+        label = planned_type_name(item) if kind in ("place_type", "place_new") else item.key[1]
+        if kind in ("align", "ok") and item.existing_instance is not None:
+            try:
+                label = type_name(item.existing_instance.Symbol)
+                if kind == "align":
+                    symbol_point = item.existing_instance.Location.Point
+            except Exception:
+                pass
+        markers.append(PreviewMarker(kind, item.point, item=item, symbol_point=symbol_point, label=label))
+    for orphan in orphans:
+        markers.append(PreviewMarker("orphan", orphan.point, orphan=orphan,
+                                     label=orphan.label.split(u" : ")[-1]))
+    return markers
+
+
+def model_sources():
+    """(document, transform or None) for the host and every loaded link."""
+    sources = [(doc, None)]
+    for link_instance in FilteredElementCollector(doc).OfClass(RevitLinkInstance):
+        try:
+            link_doc = link_instance.GetLinkDocument()
+            if link_doc is not None:
+                sources.append((link_doc, link_instance.GetTotalTransform()))
+        except Exception:
+            pass
+    return sources
+
+
+def scan_walls(bounds):
+    """Wall footprints (host coordinates) near the fixtures:
+    [(points [(x, y)], half width, z min, z max, (xmin, ymin, xmax, ymax))]."""
+    xmin, ymin, xmax, ymax = bounds
+    result = []
+    scanned = 0
+    for source_doc, tf in model_sources():
+        try:
+            walls = FilteredElementCollector(source_doc).OfClass(Wall)
+        except Exception:
+            continue
+        for wall in walls:
+            scanned += 1
+            if scanned > 80000 or len(result) > 40000:
+                return result
+            try:
+                location = wall.Location
+                if not isinstance(location, LocationCurve):
+                    continue
+                box = wall.get_BoundingBox(None)
+                if box is None:
+                    continue
+                points = list(location.Curve.Tessellate())
+                if tf is not None:
+                    points = [tf.OfPoint(p) for p in points]
+                    z0, z1 = tf.OfPoint(box.Min).Z, tf.OfPoint(box.Max).Z
+                else:
+                    z0, z1 = box.Min.Z, box.Max.Z
+                xs = [p.X for p in points]
+                ys = [p.Y for p in points]
+                if max(xs) < xmin or min(xs) > xmax or max(ys) < ymin or min(ys) > ymax:
+                    continue
+                try:
+                    half = max(wall.Width, 0.1) / 2.0
+                except Exception:
+                    half = 0.15
+                result.append(([(p.X, p.Y) for p in points], half, min(z0, z1), max(z0, z1),
+                               (min(xs), min(ys), max(xs), max(ys))))
+            except Exception:
+                continue
+    return result
+
+
+def scan_grids():
+    """[(name, (x, y), (x, y))] of the host and linked grids (host coordinates)."""
+    result = []
+    seen = set()
+    for source_doc, tf in model_sources():
+        try:
+            grids = FilteredElementCollector(source_doc).OfClass(RvtGrid)
+        except Exception:
+            continue
+        for grid in grids:
+            try:
+                curve = grid.Curve
+                a, b = curve.GetEndPoint(0), curve.GetEndPoint(1)
+                if tf is not None:
+                    a, b = tf.OfPoint(a), tf.OfPoint(b)
+                key = (grid.Name, int(round(a.X)), int(round(a.Y)), int(round(b.X)), int(round(b.Y)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append((grid.Name, (a.X, a.Y), (b.X, b.Y)))
+            except Exception:
+                continue
+    return result
+
+
+def add_quad(mesh, a, b, c, d):
+    start = mesh.Positions.Count
+    for p in (a, b, c, d):
+        mesh.Positions.Add(Point3D(p[0], p[1], p[2]))
+    for index in (0, 1, 2, 0, 2, 3):
+        mesh.TriangleIndices.Add(start + index)
+
+
+def add_prism(mesh, p, q, half, z0, z1):
+    """Wall segment p -> q (plan points) of half width `half`, from z0 to z1."""
+    dx, dy = q[0] - p[0], q[1] - p[1]
+    length = math.sqrt(dx * dx + dy * dy)
+    if length < 1e-6:
+        return
+    nx, ny = -dy / length * half, dx / length * half
+    a = (p[0] + nx, p[1] + ny)
+    b = (q[0] + nx, q[1] + ny)
+    c = (q[0] - nx, q[1] - ny)
+    d = (p[0] - nx, p[1] - ny)
+    add_quad(mesh, (a[0], a[1], z1), (b[0], b[1], z1), (c[0], c[1], z1), (d[0], d[1], z1))
+    for u, v in ((a, b), (b, c), (c, d), (d, a)):
+        add_quad(mesh, (u[0], u[1], z0), (v[0], v[1], z0), (v[0], v[1], z1), (u[0], u[1], z1))
+
+
+def add_slab(mesh, xmin, ymin, xmax, ymax, z0, z1):
+    corners = ((xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax))
+    add_quad(mesh, *[(x, y, z1) for x, y in corners])
+    for i in range(4):
+        u, v = corners[i], corners[(i + 1) % 4]
+        add_quad(mesh, (u[0], u[1], z0), (v[0], v[1], z0), (v[0], v[1], z1), (u[0], u[1], z1))
+
+
+def solid_model(mesh, color):
+    material = DiffuseMaterial(frozen_brush(color))
+    material.Freeze()
+    mesh.Freeze()
+    model = GeometryModel3D(mesh, material)
+    model.BackMaterial = material
+    return model
+
+
+def bounds_of(markers, margin):
+    xs = [m.x for m in markers]
+    ys = [m.y for m in markers]
+    return (min(xs) - margin, min(ys) - margin, max(xs) + margin, max(ys) + margin)
+
+
+class MarkerLayer(FrameworkElement):
+    """Draws markers, align arrows, grids, labels and the scale bar on top of
+    the 3D view (constant pixel size, always readable)."""
+    owner = None
+
+    def OnRender(self, drawing_context):
+        if self.owner is not None:
+            self.owner.render_overlay(drawing_context, self.ActualWidth, self.ActualHeight)
 
 
 class PreviewWindow(object):
     def __init__(self):
         self.accepted = False
         self.copy_watts = True
-        self.center = Point3D(0, 0, 0)
-        self.radius = 10.0
-        self.preset = "top"
-        self.zoom = 1.0
+        self.markers = build_markers()
+        self.visible_kinds = set(STATUS_RGB.keys())
+        self.level_key = "ALL"
+        self.level_keys = []
+        self.shown = []
+        self.screen = []
+        self.list_markers = []
+        self.hover = None
+        self.hover_pos = (0.0, 0.0)
+        self.selected = None
+        self.drag = None
+        self.walls = None
+        self.grids = None
+        self.context_cache = {}
+        self.current_context = None
+        self.show_walls = True
+        self.show_grids = True
+        self.show_labels = True
+        self.show_zones = False
+        self.list_guard = False
+        self.render_error = None
+        self.fit_pending = True
+        self.levels_by_id = dict((id_value(level.Id), level) for level in levels)
+        self.target = (0.0, 0.0, 0.0)
+        self.width = 100.0
+        self.extent = 100.0
+        if self.markers:
+            box = bounds_of(self.markers, 0.0)
+            zs = [m.z for m in self.markers]
+            self.extent = max(box[2] - box[0], box[3] - box[1], max(zs) - min(zs), 30.0)
+        # orientation of the open Revit plan, so the preview looks the same
+        self.view_yaw = -math.pi / 2
+        try:
+            up = active_view.UpDirection
+            if abs(up.Z) < 0.5:
+                self.view_yaw = math.atan2(-up.Y, -up.X)
+        except Exception:
+            pass
+        self.yaw = self.view_yaw
+        self.pitch = math.pi / 2
 
         window = Window()
         window.Title = "Light Placement 2D"
-        window.Width = 1120
-        window.Height = 760
-        window.MinWidth = 900
-        window.MinHeight = 600
+        window.Width = 1360
+        window.Height = 880
+        window.MinWidth = 1000
+        window.MinHeight = 640
         window.WindowStartupLocation = WindowStartupLocation.CenterOwner
         window.Background = brush("#F1F4F9")
         window.FontFamily = FontFamily("Segoe UI")
@@ -1387,16 +1701,7 @@ class PreviewWindow(object):
         self.orphan_count = text_block(u"", 12, True, "#BE185D", Thickness(0, 6, 0, 6))
 
         root = DockPanel()
-        header = StackPanel()
-        header.Background = brush("#1E3A8A")
-        header.Children.Add(text_block("LIGHT PLACEMENT 2D", 20, True, "#FFFFFF", Thickness(18, 12, 18, 0)))
-        header.Children.Add(text_block(
-            u"Link: {}   |   2D family: {}   |   {} fixture(s): {} NEW to place, {} existing within 350 mm "
-            u"to ALIGN, {} already aligned".format(
-                linked_doc.Title, family.Name, len(selected_items), len(to_place), len(to_align), len(already)),
-            12, False, "#DBEAFE", Thickness(18, 0, 18, 12)))
-        DockPanel.SetDock(header, Dock.Top)
-        root.Children.Add(header)
+        root.Children.Add(self.build_header())
 
         # footer
         footer = DockPanel()
@@ -1442,13 +1747,13 @@ class PreviewWindow(object):
 
         tabs = TabControl()
         tabs.Margin = Thickness(18, 12, 18, 0)
-        tabs.Items.Add(self.tab("3D preview", self.build_preview()))
+        tabs.Items.Add(self.tab("Preview", self.build_preview()))
         tabs.Items.Add(self.tab(u"Type matching ({})".format(len(rows)), self.build_matching()))
         tabs.Items.Add(self.tab(u"No linked fixture ({})".format(len(orphans)), self.build_orphans()))
         tabs.Items.Add(self.tab("Overview", self.build_overview()))
         root.Children.Add(tabs)
         window.Content = root
-        window.Loaded += lambda sender, args: self.set_camera(self.preset)
+        window.Loaded += self.on_loaded
 
     def tab(self, header, content):
         item = TabItem()
@@ -1456,124 +1761,822 @@ class PreviewWindow(object):
         item.Content = content
         return item
 
-    # ---- 3D preview -------------------------------------------------------
+    # ---- header with result cards ---------------------------------------
+    def build_header(self):
+        counts = {}
+        for marker in self.markers:
+            counts[marker.kind] = counts.get(marker.kind, 0) + 1
+        header = StackPanel()
+        gradient = LinearGradientBrush(ColorConverter.ConvertFromString("#0F172A"),
+                                       ColorConverter.ConvertFromString("#1E3A8A"), 0.0)
+        header.Background = gradient
+        header.Children.Add(text_block("LIGHT PLACEMENT 2D", 20, True, "#FFFFFF", Thickness(18, 12, 18, 0)))
+        header.Children.Add(text_block(
+            u"Link: {}   |   2D family: {}   |   Level(s): {}".format(
+                linked_doc.Title, family.Name, u", ".join(selected_level_names)),
+            12, False, "#BFDBFE", Thickness(18, 2, 18, 8)))
+        cards = WrapPanel()
+        cards.Margin = Thickness(18, 0, 18, 12)
+        for key, title in (("place_type", u"NEW SYMBOLS"), ("place_new", u"NEW SYMBOLS - NEW TYPE"),
+                           ("align", u"TO ALIGN"), ("ok", u"ALREADY ON FIXTURE"),
+                           ("orphan", u"NO LINKED FIXTURE"), ("skipped", u"CANNOT PLACE")):
+            card = Border()
+            card.CornerRadius = CornerRadius(8)
+            card.Background = SolidColorBrush(Color.FromArgb(40, 255, 255, 255))
+            card.BorderBrush = SolidColorBrush(status_color(key))
+            card.BorderThickness = Thickness(0, 0, 0, 3)
+            card.Padding = Thickness(14, 6, 14, 6)
+            card.Margin = Thickness(0, 0, 10, 0)
+            card.MinWidth = 120
+            inner = StackPanel()
+            inner.Children.Add(text_block(str(counts.get(key, 0)), 22, True, "#FFFFFF"))
+            inner.Children.Add(text_block(title, 10, True, "#CBD5E1"))
+            card.Child = inner
+            cards.Children.Add(card)
+        header.Children.Add(cards)
+        DockPanel.SetDock(header, Dock.Top)
+        return header
+
+    # ---- preview page -----------------------------------------------------
     def build_preview(self):
         page = DockPanel()
-        top = DockPanel()
-        top.Margin = Thickness(0, 0, 0, 8)
+
+        # toolbar: level, camera buttons, layer toggles
+        bar = WrapPanel()
+        bar.Margin = Thickness(0, 0, 0, 8)
+        bar.Children.Add(text_block(u"Level", 12, True, "#334155", Thickness(0, 6, 8, 0)))
+        self.level_combo = ComboBox()
+        self.level_combo.MinWidth = 240
+        self.level_combo.Height = 28
+        self.fill_levels()
+        self.level_combo.SelectionChanged += self.on_level_changed
+        bar.Children.Add(self.level_combo)
+        for name, handler in ((u"Plan", self.on_plan), (u"3D", self.on_iso), (u"Fit", self.on_fit)):
+            button = make_button(name, False)
+            button.Height = 28
+            button.MinWidth = 64
+            button.Click += handler
+            bar.Children.Add(button)
+        spacer = Border()
+        spacer.Width = 18
+        bar.Children.Add(spacer)
+        for tag, label, state in (("walls", u"Walls", self.show_walls), ("grids", u"Grids", self.show_grids),
+                                  ("labels", u"Type labels", self.show_labels),
+                                  ("zones", u"350 mm zones", self.show_zones)):
+            toggle = CheckBox()
+            toggle.Content = label
+            toggle.Tag = tag
+            toggle.IsChecked = state
+            toggle.Margin = Thickness(0, 6, 14, 0)
+            toggle.Checked += self.on_toggle
+            toggle.Unchecked += self.on_toggle
+            bar.Children.Add(toggle)
+        DockPanel.SetDock(bar, Dock.Top)
+        page.Children.Add(bar)
+
+        body = WpfGrid()
+        left_column = ColumnDefinition()
+        left_column.Width = GridLength(1, GridUnitType.Star)
+        right_column = ColumnDefinition()
+        right_column.Width = GridLength(340)
+        body.ColumnDefinitions.Add(left_column)
+        body.ColumnDefinitions.Add(right_column)
+
+        # the view: 3D context (floor + walls) with the marker layer on top
+        stage = WpfGrid()
+        stage.Background = Brushes.Transparent
+        stage.ClipToBounds = True
+        self.stage = stage
+        self.viewport = Viewport3D()
+        self.viewport.IsHitTestVisible = False
+        self.camera = OrthographicCamera()
+        self.viewport.Camera = self.camera
+        lights = Model3DGroup()
+        lights.Children.Add(AmbientLight(Color.FromRgb(105, 110, 125)))
+        lights.Children.Add(DirectionalLight(Color.FromRgb(210, 210, 220), Vector3D(-0.4, -0.6, -1.0)))
+        lights.Children.Add(DirectionalLight(Color.FromRgb(70, 70, 85), Vector3D(0.6, 0.5, -0.4)))
+        light_visual = ModelVisual3D()
+        light_visual.Content = lights
+        self.viewport.Children.Add(light_visual)
+        stage.Children.Add(self.viewport)
+        self.layer = MarkerLayer()
+        self.layer.owner = self
+        self.layer.IsHitTestVisible = False
+        stage.Children.Add(self.layer)
+        self.status_text = text_block(u"", 11, True, "#E2E8F0", Thickness(12, 10, 12, 0))
+        self.status_text.IsHitTestVisible = False
+        self.status_text.HorizontalAlignment = HorizontalAlignment.Left
+        self.status_text.VerticalAlignment = VerticalAlignment.Top
+        stage.Children.Add(self.status_text)
+        hint = text_block(u"Drag: pan   |   Right-drag: orbit   |   Wheel: zoom   |   "
+                          u"Click: details   |   Double-click: zoom to it", 11, False, "#94A3B8",
+                          Thickness(12, 0, 12, 10))
+        hint.IsHitTestVisible = False
+        hint.HorizontalAlignment = HorizontalAlignment.Right
+        hint.VerticalAlignment = VerticalAlignment.Bottom
+        stage.Children.Add(hint)
+        stage.MouseDown += self.on_mouse_down
+        stage.MouseMove += self.on_mouse_move
+        stage.MouseUp += self.on_mouse_up
+        stage.MouseWheel += self.on_wheel
+        stage.MouseLeave += self.on_mouse_leave
+        stage.SizeChanged += self.on_size_changed
+        frame = Border()
+        frame.CornerRadius = CornerRadius(10)
+        frame.Background = LinearGradientBrush(ColorConverter.ConvertFromString("#0B1120"),
+                                               ColorConverter.ConvertFromString("#1E293B"), 90.0)
+        frame.Child = stage
+        WpfGrid.SetColumn(frame, 0)
+        body.Children.Add(frame)
+
+        side = self.build_side_panel()
+        WpfGrid.SetColumn(side, 1)
+        body.Children.Add(side)
+        page.Children.Add(body)
+        return page
+
+    def build_side_panel(self):
+        panel = DockPanel()
+        panel.Margin = Thickness(12, 0, 0, 0)
+
+        legend_card = Border()
+        legend_card.Background = Brushes.White
+        legend_card.CornerRadius = CornerRadius(8)
+        legend_card.Padding = Thickness(12, 8, 12, 8)
+        legend_card.Margin = Thickness(0, 0, 0, 10)
         legend = StackPanel()
-        legend.Orientation = Orientation.Horizontal
-        for key, label in (("existing_type", "Your existing type"), ("new_type", "New type"),
-                           ("align", "Existing - will be aligned"), ("existing", "Existing - already aligned"),
-                           ("orphan", "Existing - no linked fixture"),
-                           ("outside", "Cannot place / missing level")):
+        legend.Children.Add(text_block(u"SHOW", 10, True, "#64748B", Thickness(0, 0, 0, 4)))
+        self.legend_counts = {}
+        for key, label, _ in PREVIEW_STATUSES:
+            row = DockPanel()
+            row.Margin = Thickness(0, 2, 0, 2)
+            count = text_block(u"0", 12, True, "#0F172A")
+            count.VerticalAlignment = VerticalAlignment.Center
+            DockPanel.SetDock(count, Dock.Right)
+            row.Children.Add(count)
+            self.legend_counts[key] = count
+            box = CheckBox()
+            box.IsChecked = True
+            box.Tag = key
+            box.VerticalContentAlignment = VerticalAlignment.Center
+            content = StackPanel()
+            content.Orientation = Orientation.Horizontal
             swatch = Border()
             swatch.Width = 12
             swatch.Height = 12
-            swatch.CornerRadius = CornerRadius(2)
-            swatch.Background = SolidColorBrush(STATUS_COLORS[key])
-            swatch.Margin = Thickness(0, 0, 4, 0)
-            legend.Children.Add(swatch)
-            legend.Children.Add(text_block(label, 11, False, "#334155", Thickness(0, 0, 14, 0)))
-        cams = StackPanel()
-        cams.Orientation = Orientation.Horizontal
-        for name in ("Top", "Iso", "Front", "Side", "Zoom +", "Zoom -"):
-            button = make_button(name, False)
-            button.Height = 26
-            button.MinWidth = 55
-            button.Click += self.camera_handler(name)
-            cams.Children.Add(button)
-        DockPanel.SetDock(cams, Dock.Right)
-        top.Children.Add(cams)
-        top.Children.Add(legend)
+            swatch.CornerRadius = CornerRadius(2 if key == "orphan" else 6)
+            swatch.Background = SolidColorBrush(status_color(key))
+            swatch.Margin = Thickness(2, 0, 8, 0)
+            content.Children.Add(swatch)
+            content.Children.Add(text_block(label, 12, False, "#334155"))
+            box.Content = content
+            box.Checked += self.on_kind_toggle
+            box.Unchecked += self.on_kind_toggle
+            row.Children.Add(box)
+            legend.Children.Add(row)
+        legend_card.Child = legend
+        DockPanel.SetDock(legend_card, Dock.Top)
+        panel.Children.Add(legend_card)
+
+        details_card = Border()
+        details_card.Background = Brushes.White
+        details_card.CornerRadius = CornerRadius(8)
+        details_card.Padding = Thickness(12, 10, 12, 10)
+        details_card.Margin = Thickness(0, 10, 0, 0)
+        details_card.MinHeight = 190
+        self.details = StackPanel()
+        details_card.Child = self.details
+        DockPanel.SetDock(details_card, Dock.Bottom)
+        panel.Children.Add(details_card)
+
+        list_card = Border()
+        list_card.Background = Brushes.White
+        list_card.CornerRadius = CornerRadius(8)
+        list_card.Padding = Thickness(12, 8, 12, 8)
+        list_panel = DockPanel()
+        top = StackPanel()
+        self.list_title = text_block(u"", 10, True, "#64748B", Thickness(0, 0, 0, 4))
+        top.Children.Add(self.list_title)
+        self.search_box = TextBox()
+        self.search_box.Height = 26
+        self.search_box.Padding = Thickness(4, 3, 4, 3)
+        self.search_box.ToolTip = u"Search by type, family or ID"
+        self.search_box.TextChanged += self.on_search
+        top.Children.Add(self.search_box)
         DockPanel.SetDock(top, Dock.Top)
-        page.Children.Add(top)
+        list_panel.Children.Add(top)
+        self.list_box = ListBox()
+        self.list_box.Margin = Thickness(0, 6, 0, 0)
+        self.list_box.BorderThickness = Thickness(0)
+        self.list_box.SelectionChanged += self.on_list_select
+        list_panel.Children.Add(self.list_box)
+        list_card.Child = list_panel
+        panel.Children.Add(list_card)
+        self.show_details(None)
+        return panel
 
-        self.viewport = Viewport3D()
-        self.viewport.ClipToBounds = True
-        self.viewport.MouseWheel += self.on_wheel
-        frame = Border()
-        frame.Background = brush("#0F172A")
-        frame.CornerRadius = CornerRadius(8)
-        frame.Child = self.viewport
-        page.Children.Add(frame)
-        self.build_scene()
-        return page
+    # ---- levels -------------------------------------------------------------
+    def fill_levels(self):
+        level_ids = set(m.level_id for m in self.markers if m.level_id is not None)
+        ordered = sorted([lid for lid in level_ids if lid in self.levels_by_id],
+                         key=lambda lid: self.levels_by_id[lid].Elevation)
+        self.level_keys = ["ALL"] + ordered
+        entry = ComboBoxItem()
+        entry.Content = u"All selected levels   ({})".format(len(self.markers))
+        self.level_combo.Items.Add(entry)
+        for lid in ordered:
+            entry = ComboBoxItem()
+            entry.Content = u"{}   ({})".format(self.levels_by_id[lid].Name,
+                                                sum(1 for m in self.markers if m.level_id == lid))
+            self.level_combo.Items.Add(entry)
+        default = 0
+        try:
+            view_level = id_value(active_view.GenLevel.Id) if active_view.GenLevel is not None else None
+        except Exception:
+            view_level = None
+        if view_level in ordered:
+            default = self.level_keys.index(view_level)
+        elif ordered:
+            busiest = max(ordered, key=lambda lid: sum(1 for m in self.markers if m.level_id == lid))
+            default = self.level_keys.index(busiest)
+        self.default_level_index = default
 
-    def build_scene(self):
-        points = [i.point for i in selected_items if i.point is not None] + [o.point for o in orphans]
-        if not points:
-            return
-        min_x = min(p.X for p in points); max_x = max(p.X for p in points)
-        min_y = min(p.Y for p in points); max_y = max(p.Y for p in points)
-        min_z = min(p.Z for p in points); max_z = max(p.Z for p in points)
-        self.center = Point3D((min_x + max_x) / 2, (min_y + max_y) / 2, (min_z + max_z) / 2)
-        self.radius = max(1.0, math.sqrt((max_x - min_x) ** 2 + (max_y - min_y) ** 2 + (max_z - min_z) ** 2) / 2)
-        half = max(self.radius * 0.006, 0.3)
+    def on_loaded(self, sender, args):
+        self.level_combo.SelectedIndex = self.default_level_index   # -> on_level_changed
 
-        meshes = dict((key, MeshGeometry3D()) for key in STATUS_COLORS)
-        for item in selected_items:
-            if item.point is not None:
-                self.add_cube(meshes[item_color_key(item)], item.point, half)
-        for orphan in orphans:
-            self.add_cube(meshes["orphan"], orphan.point, half)
-        scene = Model3DGroup()
-        scene.Children.Add(AmbientLight(Color.FromRgb(170, 180, 200)))
-        scene.Children.Add(DirectionalLight(Color.FromRgb(255, 255, 255), Vector3D(-1, -2, -3)))
-        for key, mesh in meshes.items():
-            if mesh.Positions.Count:
-                material = DiffuseMaterial(SolidColorBrush(STATUS_COLORS[key]))
-                model = GeometryModel3D(mesh, material)
-                model.BackMaterial = material
-                scene.Children.Add(model)
-        visual = ModelVisual3D()
-        visual.Content = scene
+    def on_level_changed(self, sender, args):
+        index = self.level_combo.SelectedIndex
+        if 0 <= index < len(self.level_keys):
+            self.set_level(self.level_keys[index])
+
+    def set_level(self, key):
+        self.level_key = key
+        self.selected = None
+        self.hover = None
+        self.show_details(None)
+        self.update_context()
+        self.refresh(fit=True)
+
+    def level_markers(self):
+        if self.level_key == "ALL":
+            return list(self.markers)
+        return [m for m in self.markers if m.level_id == self.level_key]
+
+    # ---- 3D context: floor slab + walls of the loaded links ------------
+    def get_walls(self):
+        if self.walls is None:
+            self.walls = []
+            if self.markers:
+                try:
+                    self.walls = scan_walls(bounds_of(self.markers, 15.0 * FEET_PER_M))
+                except Exception:
+                    self.walls = []
+        return self.walls
+
+    def get_grids(self):
+        if self.grids is None:
+            try:
+                self.grids = scan_grids()
+            except Exception:
+                self.grids = []
+        return self.grids
+
+    def update_context(self):
+        if self.current_context is not None:
+            self.viewport.Children.Remove(self.current_context)
+            self.current_context = None
+        key = (self.level_key, self.show_walls)
+        visual = self.context_cache.get(key)
+        if visual is None:
+            try:
+                visual = self.build_context(self.level_key, self.show_walls)
+            except Exception:
+                visual = None
+            if visual is None:
+                return
+            self.context_cache[key] = visual
         self.viewport.Children.Add(visual)
+        self.current_context = visual
 
-    @staticmethod
-    def add_cube(mesh, point, half):
-        start = mesh.Positions.Count
-        for dx in (-half, half):
-            for dy in (-half, half):
-                for dz in (-half * 0.4, half * 0.4):
-                    mesh.Positions.Add(Point3D(point.X + dx, point.Y + dy, point.Z + dz))
-        for a, b, c, d in ((0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1), (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)):
-            for index in (a, b, c, a, c, d):
-                mesh.TriangleIndices.Add(start + index)
+    def build_context(self, level_key, with_walls):
+        group = Model3DGroup()
+        slab = MeshGeometry3D()
+        margin = 3.0 * FEET_PER_M
+        if level_key == "ALL":
+            by_level = {}
+            for marker in self.markers:
+                if marker.level_id in self.levels_by_id:
+                    by_level.setdefault(marker.level_id, []).append(marker)
+            for lid, members in by_level.items():
+                z = self.levels_by_id[lid].Elevation
+                xmin, ymin, xmax, ymax = bounds_of(members, margin)
+                add_slab(slab, xmin, ymin, xmax, ymax, z - 0.8, z - 0.15)
+        else:
+            level = self.levels_by_id.get(level_key)
+            members = self.level_markers()
+            if level is None or not members:
+                return None
+            z = level.Elevation
+            xmin, ymin, xmax, ymax = bounds_of(members, margin)
+            add_slab(slab, xmin, ymin, xmax, ymax, z - 0.8, z - 0.15)
+            if with_walls:
+                walls = MeshGeometry3D()
+                cut = z + WALL_CUT
+                count = 0
+                for points, half, z0, z1, box in self.get_walls():
+                    if z0 > cut or z1 < cut:
+                        continue
+                    if box[2] < xmin or box[0] > xmax or box[3] < ymin or box[1] > ymax:
+                        continue
+                    base = max(z0, z)
+                    for i in range(len(points) - 1):
+                        add_prism(walls, points[i], points[i + 1], half, base, cut)
+                    count += 1
+                    if count > 20000:
+                        break
+                if walls.Positions.Count:
+                    group.Children.Add(solid_model(walls, Color.FromRgb(148, 163, 184)))
+        if slab.Positions.Count:
+            group.Children.Add(solid_model(slab, Color.FromRgb(30, 41, 59)))
+        visual = ModelVisual3D()
+        visual.Content = group
+        return visual
 
-    def camera_handler(self, name):
-        def handler(sender, args):
-            if name == "Zoom +":
-                self.zoom = max(0.05, self.zoom * 0.7)
-            elif name == "Zoom -":
-                self.zoom = min(5.0, self.zoom / 0.7)
+    # ---- filtering, list and details -----------------------------------
+    def refresh(self, fit=False):
+        in_level = self.level_markers()
+        counts = {}
+        for marker in in_level:
+            counts[marker.kind] = counts.get(marker.kind, 0) + 1
+        for key, block in self.legend_counts.items():
+            block.Text = str(counts.get(key, 0))
+        self.shown = sorted([m for m in in_level if m.kind in self.visible_kinds],
+                            key=lambda m: DRAW_ORDER[m.kind])
+        level = self.levels_by_id.get(self.level_key)
+        self.status_text.Text = u"{}   |   {} shown".format(
+            level.Name if level is not None else u"All selected levels", len(self.shown))
+        self.fill_list()
+        if fit:
+            self.fit(in_level)
+        else:
+            self.layer.InvalidateVisual()
+
+    def fill_list(self):
+        text = (self.search_box.Text or u"").strip().lower()
+        members = [m for m in self.shown if not text or text in m.search]
+        members.sort(key=lambda m: (LIST_ORDER[m.kind], m.title.lower(), m.ident))
+        self.list_guard = True
+        self.list_box.Items.Clear()
+        self.list_markers = members[:800]
+        for marker in self.list_markers:
+            entry = ListBoxItem()
+            line = StackPanel()
+            line.Orientation = Orientation.Horizontal
+            dot = Border()
+            dot.Width = 9
+            dot.Height = 9
+            dot.CornerRadius = CornerRadius(1 if marker.kind == "orphan" else 4.5)
+            dot.Background = SolidColorBrush(status_color(marker.kind))
+            dot.Margin = Thickness(0, 0, 7, 0)
+            dot.VerticalAlignment = VerticalAlignment.Center
+            line.Children.Add(dot)
+            caption = TextBlock()
+            caption.Text = u"{}  {}  ·  {}".format(STATUS_SHORT[marker.kind], marker.title, marker.ident)
+            caption.FontSize = 11
+            line.Children.Add(caption)
+            entry.Content = line
+            entry.Padding = Thickness(2, 1, 2, 1)
+            self.list_box.Items.Add(entry)
+        if len(members) > len(self.list_markers):
+            more = ListBoxItem()
+            more.Content = u"... {} more - type in the search box".format(len(members) - len(self.list_markers))
+            more.IsEnabled = False
+            self.list_box.Items.Add(more)
+        self.list_guard = False
+        self.list_title.Text = u"FIXTURES & SYMBOLS   ({})".format(len(members))
+
+    def on_search(self, sender, args):
+        self.fill_list()
+
+    def on_list_select(self, sender, args):
+        if self.list_guard:
+            return
+        index = self.list_box.SelectedIndex
+        if 0 <= index < len(self.list_markers):
+            self.select(self.list_markers[index], zoom=True, from_list=True)
+
+    def on_kind_toggle(self, sender, args):
+        key = sender.Tag
+        if sender.IsChecked == True:
+            self.visible_kinds.add(key)
+        else:
+            self.visible_kinds.discard(key)
+        self.refresh()
+
+    def on_toggle(self, sender, args):
+        tag = sender.Tag
+        state = sender.IsChecked == True
+        if tag == "walls":
+            self.show_walls = state
+            self.update_context()
+        elif tag == "grids":
+            self.show_grids = state
+        elif tag == "labels":
+            self.show_labels = state
+        elif tag == "zones":
+            self.show_zones = state
+        self.layer.InvalidateVisual()
+
+    def select(self, marker, zoom=False, from_list=False):
+        self.selected = marker
+        self.show_details(marker)
+        if marker is not None and zoom:
+            self.target = (marker.x, marker.y, marker.z)
+            self.width = min(self.width, 10.0 * FEET_PER_M)
+        if marker is not None and not from_list:
+            for index, candidate in enumerate(self.list_markers):
+                if candidate is marker:
+                    self.list_guard = True
+                    self.list_box.SelectedIndex = index
+                    self.list_box.ScrollIntoView(self.list_box.Items[index])
+                    self.list_guard = False
+                    break
+        self.apply_camera()
+
+    def detail_lines(self, marker):
+        if marker.item is None:
+            orphan = marker.orphan
+            tilted = getattr(orphan, "tilted", False)
+            return [
+                (u"Symbol", orphan.label),
+                (u"Element ID", str(marker.ident)),
+                (u"Level", orphan.level_name),
+                (u"Circuit", u"connected" if orphan.circuits else u"-"),
+                (u"Result", u"Lies on a sloped / vertical face - plan views cannot show it. A flat symbol "
+                            u"is placed instead; delete this one on the 'No linked fixture' tab."
+                 if tilted else
+                 u"No linked fixture within 350 mm. Deleted only if you tick it on the "
+                 u"'No linked fixture' tab."),
+            ]
+        item = marker.item
+        lines = [
+            (u"Family", item.key[0]),
+            (u"Linked ID", str(marker.ident)),
+            (u"Level", u"{}  ->  {}".format(item.level.Name if item.level is not None else u"-",
+                                            item.target_level.Name if item.target_level is not None else u"-")),
+        ]
+        above = height_above_level(item)
+        if above is not None:
+            text = u"{} mm above level".format(int(round(above)))
+            if above < MIN_SYMBOL_LIFT * 304.8:
+                text += u"  (symbol goes 10 mm above the level)"
+            lines.append((u"Height", text))
+        kind = marker.kind
+        if kind in ("place_type", "place_new"):
+            lines.append((u"Result", u"A new 2D symbol is placed on this fixture."))
+            lines.append((u"2D type", planned_type_name(item) +
+                          (u"   (new type, created in '{}')".format(family.Name) if kind == "place_new" else u"")))
+        elif kind == "align":
+            lines.append((u"Result", u"The existing symbol moves {} mm onto the fixture - plan only; "
+                                     u"height, type and circuit stay.".format(
+                                         int(round(getattr(item, "existing_distance", 0.0) * 304.8)))))
+            lines.append((u"Symbol", u"{}   (ID {})".format(marker.label, id_value(item.existing_id))))
+            lines.append((u"Matched by", getattr(item, "existing_how", u"-")))
+        elif kind == "ok":
+            lines.append((u"Result", u"A symbol already sits on this fixture - nothing changes."))
+            lines.append((u"Symbol", u"{}   (ID {})".format(marker.label, id_value(item.existing_id))))
+        else:
+            lines.append((u"Result", u"Not placed: " + SKIP_TEXT.get(item.status, item.status)))
+        if item.watt_text:
+            lines.append((u"Wattage", item.watt_text))
+        if id_value(item.fixture.Id) in off_geometry_ids:
+            lines.append((u"Position", u"fixture centre (its insertion point is away from its geometry)"))
+        return lines
+
+    def show_details(self, marker):
+        self.details.Children.Clear()
+        self.details.Children.Add(text_block(u"DETAILS", 10, True, "#64748B", Thickness(0, 0, 0, 6)))
+        if marker is None:
+            self.details.Children.Add(text_block(
+                u"Click a marker in the view, or an entry in the list, to see exactly what will happen "
+                u"to it.", 12, False, "#64748B"))
+            return
+        self.details.Children.Add(text_block(marker.title, 14, True, "#0F172A", Thickness(0, 0, 0, 4)))
+        chip = Border()
+        chip.CornerRadius = CornerRadius(10)
+        chip.Background = SolidColorBrush(status_color(marker.kind, 40))
+        chip.BorderBrush = SolidColorBrush(status_color(marker.kind))
+        chip.BorderThickness = Thickness(1)
+        chip.Padding = Thickness(8, 2, 8, 2)
+        chip.HorizontalAlignment = HorizontalAlignment.Left
+        chip.Margin = Thickness(0, 0, 0, 8)
+        chip.Child = text_block(STATUS_LABEL[marker.kind], 11, True, "#0F172A")
+        self.details.Children.Add(chip)
+        grid = WpfGrid()
+        key_column = ColumnDefinition()
+        key_column.Width = GridLength(82)
+        value_column = ColumnDefinition()
+        value_column.Width = GridLength(1, GridUnitType.Star)
+        grid.ColumnDefinitions.Add(key_column)
+        grid.ColumnDefinitions.Add(value_column)
+        for row_index, (key, value) in enumerate(self.detail_lines(marker)):
+            definition = RowDefinition()
+            definition.Height = GridLength.Auto
+            grid.RowDefinitions.Add(definition)
+            name = text_block(key, 11, False, "#64748B", Thickness(0, 2, 6, 2))
+            text = text_block(value or u"-", 11, False, "#0F172A", Thickness(0, 2, 0, 2))
+            WpfGrid.SetRow(name, row_index)
+            WpfGrid.SetRow(text, row_index)
+            WpfGrid.SetColumn(text, 1)
+            grid.Children.Add(name)
+            grid.Children.Add(text)
+        self.details.Children.Add(grid)
+
+    # ---- camera (orthographic: exact plan look, true 3D when orbiting) --
+    def vectors(self):
+        cp, sp = math.cos(self.pitch), math.sin(self.pitch)
+        cy, sy = math.cos(self.yaw), math.sin(self.yaw)
+        d = (cp * cy, cp * sy, sp)                 # from target towards the camera
+        up = (-sp * cy, -sp * sy, cp)
+        look = (-d[0], -d[1], -d[2])
+        right = (look[1] * up[2] - look[2] * up[1],
+                 look[2] * up[0] - look[0] * up[2],
+                 look[0] * up[1] - look[1] * up[0])
+        return d, up, right
+
+    def apply_camera(self):
+        d, up, right = self.vectors()
+        distance = self.extent * 3.0 + 300.0
+        t = self.target
+        self.camera.Position = Point3D(t[0] + d[0] * distance, t[1] + d[1] * distance, t[2] + d[2] * distance)
+        self.camera.LookDirection = Vector3D(-d[0], -d[1], -d[2])
+        self.camera.UpDirection = Vector3D(up[0], up[1], up[2])
+        self.camera.Width = self.width
+        self.camera.NearPlaneDistance = 1.0
+        self.camera.FarPlaneDistance = distance * 2.0 + self.extent * 2.0
+        self.layer.InvalidateVisual()
+
+    def fit(self, members=None):
+        members = members if members is not None else self.level_markers()
+        if not members:
+            self.apply_camera()
+            return
+        w = max(self.stage.ActualWidth, 400.0)
+        h = max(self.stage.ActualHeight, 300.0)
+        xs = [m.x for m in members]
+        ys = [m.y for m in members]
+        zs = [m.z for m in members]
+        cx, cy, cz = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2, (min(zs) + max(zs)) / 2
+        self.target = (cx, cy, cz)
+        d, up, right = self.vectors()
+        along_r = [(m.x - cx) * right[0] + (m.y - cy) * right[1] + (m.z - cz) * right[2] for m in members]
+        along_u = [(m.x - cx) * up[0] + (m.y - cy) * up[1] + (m.z - cz) * up[2] for m in members]
+        span_r = max(along_r) - min(along_r)
+        span_u = max(along_u) - min(along_u)
+        self.width = max(span_r, span_u * w / h) * 1.12 + 3.0 * FEET_PER_M
+        self.apply_camera()
+
+    def on_plan(self, sender, args):
+        self.yaw = self.view_yaw
+        self.pitch = math.pi / 2
+        self.fit()
+
+    def on_iso(self, sender, args):
+        self.yaw = self.view_yaw - math.pi / 4
+        self.pitch = math.radians(35)
+        self.fit()
+
+    def on_fit(self, sender, args):
+        self.fit()
+
+    def on_size_changed(self, sender, args):
+        if self.fit_pending and self.stage.ActualWidth > 50:
+            self.fit_pending = False
+            self.fit()
+        else:
+            self.apply_camera()
+
+    # ---- mouse ------------------------------------------------------------
+    def pick(self, x, y, radius=10.0):
+        best, best_distance = None, radius * radius
+        for sx, sy, marker in self.screen:
+            distance = (sx - x) ** 2 + (sy - y) ** 2
+            if distance <= best_distance:
+                best, best_distance = marker, distance
+        return best
+
+    def on_mouse_down(self, sender, args):
+        position = args.GetPosition(self.stage)
+        if args.ChangedButton == MouseButton.Left and args.ClickCount == 2:
+            marker = self.pick(position.X, position.Y)
+            if marker is not None:
+                self.select(marker, zoom=True)
+            return
+        mode = "orbit" if args.ChangedButton == MouseButton.Right else "pan"
+        self.drag = {"mode": mode, "x": position.X, "y": position.Y, "moved": False,
+                     "left": args.ChangedButton == MouseButton.Left}
+        self.stage.CaptureMouse()
+
+    def on_mouse_move(self, sender, args):
+        position = args.GetPosition(self.stage)
+        drag = self.drag
+        if drag is not None:
+            dx, dy = position.X - drag["x"], position.Y - drag["y"]
+            if not drag["moved"] and abs(dx) + abs(dy) < 4:
+                return
+            drag["moved"] = True
+            drag["x"], drag["y"] = position.X, position.Y
+            if drag["mode"] == "pan":
+                scale = max(self.stage.ActualWidth, 1.0) / self.width
+                d, up, right = self.vectors()
+                t = self.target
+                self.target = (t[0] - right[0] * dx / scale + up[0] * dy / scale,
+                               t[1] - right[1] * dx / scale + up[1] * dy / scale,
+                               t[2] - right[2] * dx / scale + up[2] * dy / scale)
             else:
-                self.zoom = 1.0
-                self.preset = name.lower()
-            self.set_camera(self.preset)
-        return handler
+                self.yaw -= dx * 0.01
+                self.pitch = max(math.radians(10), min(math.pi / 2, self.pitch + dy * 0.01))
+            self.apply_camera()
+            return
+        marker = self.pick(position.X, position.Y)
+        if marker is not self.hover:
+            self.hover = marker
+            self.layer.InvalidateVisual()
+        self.stage.Cursor = Cursors.Hand if marker is not None else Cursors.Arrow
+
+    def on_mouse_up(self, sender, args):
+        drag = self.drag
+        if drag is None:
+            return
+        self.drag = None
+        self.stage.ReleaseMouseCapture()
+        if not drag["moved"] and drag["left"]:
+            position = args.GetPosition(self.stage)
+            self.select(self.pick(position.X, position.Y))
+
+    def on_mouse_leave(self, sender, args):
+        if self.hover is not None and self.drag is None:
+            self.hover = None
+            self.layer.InvalidateVisual()
 
     def on_wheel(self, sender, args):
-        self.zoom = max(0.05, min(5.0, self.zoom * (0.85 if args.Delta > 0 else 1.0 / 0.85)))
-        self.set_camera(self.preset)
+        position = args.GetPosition(self.stage)
+        w, h = max(self.stage.ActualWidth, 1.0), max(self.stage.ActualHeight, 1.0)
+        new_width = max(1.0 * FEET_PER_M, min(5000.0 * FEET_PER_M,
+                                                self.width * (0.8 if args.Delta > 0 else 1.25)))
+        factor = new_width / self.width
+        scale = w / self.width
+        d, up, right = self.vectors()
+        ox, oy = (position.X - w / 2) / scale, (h / 2 - position.Y) / scale
+        t = self.target
+        keep = 1.0 - factor                         # keep the point under the cursor in place
+        self.target = (t[0] + (right[0] * ox + up[0] * oy) * keep,
+                       t[1] + (right[1] * ox + up[1] * oy) * keep,
+                       t[2] + (right[2] * ox + up[2] * oy) * keep)
+        self.width = new_width
+        self.apply_camera()
+        args.Handled = True
 
-    def set_camera(self, preset):
-        directions = {
-            "top": (Vector3D(0, 0, 1), Vector3D(0, 1, 0)),
-            "front": (Vector3D(0, -1, 0), Vector3D(0, 0, 1)),
-            "side": (Vector3D(-1, 0, 0), Vector3D(0, 0, 1)),
-        }
-        direction, up = directions.get(preset, (Vector3D(1, -1, 1), Vector3D(0, 0, 1)))
-        direction.Normalize()
-        distance = max(10.0, self.radius / math.tan(math.pi / 8) * 1.4) * self.zoom
-        position = Point3D(self.center.X + direction.X * distance,
-                           self.center.Y + direction.Y * distance,
-                           self.center.Z + direction.Z * distance)
-        look = Vector3D(self.center.X - position.X, self.center.Y - position.Y, self.center.Z - position.Z)
-        camera = PerspectiveCamera(position, look, up, 45)
-        camera.NearPlaneDistance = 0.1
-        camera.FarPlaneDistance = distance * 4
-        self.viewport.Camera = camera
+    # ---- overlay drawing ---------------------------------------------------
+    def render_overlay(self, dc, w, h):
+        self.screen = []
+        if w < 10 or h < 10:
+            return
+        try:
+            self.draw_overlay(dc, w, h)
+        except Exception as error:
+            if self.render_error is None:
+                self.render_error = u"{}".format(error)
+                try:
+                    self.status_text.Text = u"Preview drawing problem: " + self.render_error
+                except Exception:
+                    pass
+
+    def draw_overlay(self, dc, w, h):
+        d, up, right = self.vectors()
+        tx, ty, tz = self.target
+        scale = w / self.width
+        cx, cy = w / 2.0, h / 2.0
+        r0, r1, r2 = right
+        u0, u1, u2 = up
+
+        def project(x, y, z):
+            rx, ry, rz = x - tx, y - ty, z - tz
+            return (cx + (rx * r0 + ry * r1 + rz * r2) * scale,
+                    cy - (rx * u0 + ry * u1 + rz * u2) * scale)
+
+        level = self.levels_by_id.get(self.level_key)
+
+        # grids with bubbles (on the level plane)
+        if self.show_grids and level is not None:
+            z = level.Elevation
+            for name, a, b in self.get_grids():
+                pa = project(a[0], a[1], z)
+                pb = project(b[0], b[1], z)
+                dc.DrawLine(GRID_PEN, WinPoint(pa[0], pa[1]), WinPoint(pb[0], pb[1]))
+                vx, vy = pa[0] - pb[0], pa[1] - pb[1]
+                length = math.sqrt(vx * vx + vy * vy)
+                if length < 1.0:
+                    continue
+                vx, vy = vx / length, vy / length
+                label = formatted(name, 10.0, "grid", True)
+                for (px, py), sign in ((pa, 1.0), (pb, -1.0)):
+                    bx, by = px + vx * sign * 13.0, py + vy * sign * 13.0
+                    if -20 < bx < w + 20 and -20 < by < h + 20:
+                        dc.DrawEllipse(BUBBLE_FILL, GRID_BUBBLE_PEN, WinPoint(bx, by), 11.0, 11.0)
+                        dc.DrawText(label, WinPoint(bx - label.Width / 2, by - label.Height / 2))
+
+        # 350 mm matching zones
+        zone = EXISTING_RADIUS * scale
+        if self.show_zones and zone >= 4.0:
+            for marker in self.shown:
+                if marker.kind == "orphan":
+                    continue
+                x, y = project(marker.x, marker.y, marker.z)
+                if -zone < x < w + zone and -zone < y < h + zone:
+                    dc.DrawEllipse(None, ZONE_PEN, WinPoint(x, y), zone, zone)
+
+        # markers (draw order: OK at the bottom, problems on top)
+        screen = []
+        for marker in self.shown:
+            x, y = project(marker.x, marker.y, marker.z)
+            kind = marker.kind
+            if kind == "align" and marker.sym is not None:
+                sx, sy = project(marker.sym[0], marker.sym[1], marker.sym[2])
+                if max(x, sx) < -40 or min(x, sx) > w + 40 or max(y, sy) < -40 or min(y, sy) > h + 40:
+                    continue
+                dc.DrawLine(ALIGN_PEN, WinPoint(sx, sy), WinPoint(x, y))
+                vx, vy = x - sx, y - sy
+                length = math.sqrt(vx * vx + vy * vy)
+                if length > 12.0:                       # arrow head at the fixture
+                    vx, vy = vx / length, vy / length
+                    hx, hy = x - vx * 7.0, y - vy * 7.0
+                    for side in (1.0, -1.0):
+                        dc.DrawLine(ALIGN_PEN, WinPoint(hx, hy),
+                                    WinPoint(hx - vx * 7.0 - vy * 5.0 * side, hy - vy * 7.0 + vx * 5.0 * side))
+                dc.DrawRectangle(FILL["align"], OUTLINE_PEN, Rect(sx - 4.0, sy - 4.0, 8.0, 8.0))
+                dc.DrawEllipse(None, ALIGN_RING, WinPoint(x, y), 6.0, 6.0)
+            else:
+                if x < -40 or x > w + 40 or y < -40 or y > h + 40:
+                    continue
+                if kind == "orphan":
+                    dc.DrawRectangle(FILL["orphan"], OUTLINE_PEN, Rect(x - 4.5, y - 4.5, 9.0, 9.0))
+                else:
+                    radius = 4.0 if kind == "ok" else 5.5
+                    dc.DrawEllipse(FILL[kind], OUTLINE_PEN, WinPoint(x, y), radius, radius)
+            screen.append((x, y, marker))
+        self.screen = screen
+
+        # type labels when zoomed in enough to read them
+        if self.show_labels and scale * FEET_PER_M >= 16.0:
+            drawn = 0
+            for x, y, marker in screen:
+                if 0 <= x <= w and 0 <= y <= h and marker.label:
+                    label = formatted(marker.label, 10.0, "label")
+                    dc.DrawText(label, WinPoint(x + 8.0, y - label.Height - 1.0))
+                    drawn += 1
+                    if drawn >= 600:
+                        break
+
+        # selection
+        if self.selected is not None:
+            x, y = project(self.selected.x, self.selected.y, self.selected.z)
+            dc.DrawEllipse(None, SELECT_HALO, WinPoint(x, y), 12.0, 12.0)
+            dc.DrawEllipse(None, SELECT_PEN, WinPoint(x, y), 12.0, 12.0)
+
+        # hover card
+        if self.hover is not None:
+            marker = self.hover
+            x, y = project(marker.x, marker.y, marker.z)
+            lines = [formatted(marker.title, 12.0, "text", True),
+                     formatted(STATUS_LABEL[marker.kind], 11.0, marker.kind, True)]
+            if marker.label and marker.label != marker.title:
+                lines.append(formatted(u"2D type: {}".format(marker.label), 11.0, "label"))
+            lines.append(formatted(u"ID {}".format(marker.ident), 10.0, "muted"))
+            card_w = max(line.Width for line in lines) + 20.0
+            card_h = sum(line.Height for line in lines) + 14.0
+            bx = x + 16.0 if x + 16.0 + card_w < w else x - 16.0 - card_w
+            by = y + 16.0 if y + 16.0 + card_h < h else y - 16.0 - card_h
+            dc.DrawRoundedRectangle(CARD_FILL, CARD_PEN, Rect(bx, by, card_w, card_h), 6.0, 6.0)
+            ty_ = by + 7.0
+            for line in lines:
+                dc.DrawText(line, WinPoint(bx + 10.0, ty_))
+                ty_ += line.Height
+
+        # scale bar
+        per_metre = scale * FEET_PER_M
+        length_m = 1000.0
+        for candidate in (0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000):
+            if candidate * per_metre >= 70.0:
+                length_m = candidate
+                break
+        bar = length_m * per_metre
+        x0, y0 = 16.0, h - 20.0
+        dc.DrawLine(SCALE_PEN, WinPoint(x0, y0), WinPoint(x0 + bar, y0))
+        dc.DrawLine(SCALE_PEN, WinPoint(x0, y0 - 5.0), WinPoint(x0, y0 + 1.0))
+        dc.DrawLine(SCALE_PEN, WinPoint(x0 + bar, y0 - 5.0), WinPoint(x0 + bar, y0 + 1.0))
+        caption = formatted(u"{:g} m".format(length_m), 11.0, "text", True)
+        dc.DrawText(caption, WinPoint(x0 + bar + 8.0, y0 - caption.Height / 2.0 - 2.0))
 
     # ---- type matching table ---------------------------------------------
     def build_matching(self):
@@ -1689,7 +2692,7 @@ class PreviewWindow(object):
         page.Margin = Thickness(12)
         page.Children.Add(text_block(
             u"Existing symbols on the selected level(s) with NO linked lighting fixture within 350 mm "
-            u"(checked against every linked fixture, any level). Pink in the 3D preview.",
+            u"(checked against every linked fixture, any level). Pink squares in the Preview.",
             12, False, "#334155", Thickness(0, 0, 0, 6)))
         page.Children.Add(self.delete_box)
         page.Children.Add(self.other_box)
