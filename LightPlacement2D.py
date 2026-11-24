@@ -384,6 +384,16 @@ def same_floor(instance, point, item):
     return z is not None and abs(z - point.Z) < 1500.0 / 304.8
 
 
+def is_tilted(instance):
+    """True when the instance does not lie flat (hosted on a sloped / vertical
+    face). Its 2D symbolic lines are then drawn in that tilted plane and plan
+    views do NOT show them."""
+    try:
+        return abs(instance.GetTransform().BasisZ.Z) < 0.99
+    except Exception:
+        return False
+
+
 def is_face_hosted(instance):
     try:
         return instance.HostFace is not None
@@ -410,10 +420,12 @@ def place_in_model(link, transform, fixture, symbol, point, levels,
         except Exception as error:
             errors.append(str(error))
 
-    # b) face-based families: host on the same linked face as the fixture
+    # b) face-based families: host on the same linked face as the fixture -
+    #    ONLY when that face is horizontal (on a sloped / vertical face the
+    #    symbol's 2D lines would not show in plan)
     try:
         host_face = fixture.HostFace
-        if host_face:
+        if host_face and not is_tilted(fixture):
             link_face = host_face.CreateLinkReference(link)
             direction = transform.OfVector(fixture.HandOrientation)
             if direction.GetLength() > 1e-9:
@@ -875,6 +887,7 @@ for item in items:
 EXISTING_RADIUS = 350.0 / 304.8          # 350 mm in feet
 
 existing = []        # (point, instance, owner view id, source link id, source fixture id)
+tilted_records = []  # our symbols lying on a sloped / vertical face: invisible in plan
 lighting_category = int(BuiltInCategory.OST_LightingFixtures)
 for instance in FilteredElementCollector(doc).OfClass(FamilyInstance):
     try:
@@ -888,8 +901,13 @@ for instance in FilteredElementCollector(doc).OfClass(FamilyInstance):
         if not (in_family or source_fixture_id is not None):
             continue                       # not a 2D symbol of ours
         owner_view_id = instance.OwnerViewId
-        existing.append((instance.Location.Point, instance, owner_view_id,
-                         source_link_id, source_fixture_id))
+        record = (instance.Location.Point, instance, owner_view_id,
+                  source_link_id, source_fixture_id)
+        if (owner_view_id is None or owner_view_id == ElementId.InvalidElementId) \
+                and is_tilted(instance):
+            tilted_records.append(record)  # does not count: a flat symbol is placed
+            continue
+        existing.append(record)
     except Exception:
         continue
 
@@ -1184,6 +1202,20 @@ for record in existing:
             continue
         orphan = Orphan(record)
         orphan.level_name = level_names.get(level_id, u"-")
+        orphan.level_id = level_id
+        orphans.append(orphan)
+    except Exception:
+        continue
+for record in tilted_records:
+    try:
+        level_id = record_level_id(record)
+        if level_id not in selected_host_level_ids:
+            continue
+        orphan = Orphan(record)
+        orphan.label += u"  (tilted - not shown in plan)"
+        orphan.tilted = True
+        orphan.level_name = level_names.get(level_id, u"-")
+        orphan.level_id = level_id
         orphans.append(orphan)
     except Exception:
         continue
@@ -2059,6 +2091,10 @@ if failed:
 if placement_notes:
     summary.append(u"{} note(s): symbols placed but e.g. a new type, rotation or wattage could not be "
                    u"set - see 'Placed, with a note' in the output window.".format(len(placement_notes)))
+if tilted_records:
+    summary.append(u"{} existing symbol(s) lie on a sloped / vertical face, so plan views cannot show "
+                   u"them - they were ignored and flat symbols placed. They are listed on the "
+                   u"'No linked fixture' tab (marked 'tilted') to delete.".format(len(tilted_records)))
 if off_geometry_ids:
     summary.append(u"{} fixture(s) have their insertion point away from their geometry - "
                    u"symbols go to the fixture centre (older symbols beside them are aligned "
