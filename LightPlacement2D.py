@@ -899,7 +899,7 @@ selected_levels = forms.SelectFromList.show(
     level_options,
     name_attr="name",
     multiselect=True,
-    title="Select linked fixture levels (counts use the fixtures' assigned level)",
+    title="Select the floors - fixtures assigned to another level but sitting on a selected floor are included too",
     button_name="Use selected levels"
 )
 if not selected_levels:
@@ -916,6 +916,46 @@ selected_level_names = sorted(
     for level in link_levels
     if id_value(level.Id) in selected_level_ids
 )
+
+# -----------------------------------------------------------------------------
+# Fixtures that physically sit on a selected floor are processed with it, even
+# when the link assigns them to ANOTHER level (e.g. wall / surface lights
+# hosted on level "G01" at 0 mm that show in the "P01" plan). Floor band:
+# from 0.6 m below the selected host level up to the next storey (2 m+ above).
+# -----------------------------------------------------------------------------
+FLOOR_BAND_BELOW = 0.6 * 1000.0 / 304.8
+STOREY_MIN_HEIGHT = 2.0 * 1000.0 / 304.8
+storey_levels = sorted([level for level in levels if id_value(level.Id) in views_by_level],
+                       key=lambda level: level.Elevation) or list(levels)
+for item in items:
+    item.in_selection = item.level is not None and id_value(item.level.Id) in selected_level_ids
+    item.band_included = False
+selected_floors = []
+for item in items:
+    if item.in_selection and item.target_level is not None \
+            and all(f.Id != item.target_level.Id for f in selected_floors):
+        selected_floors.append(item.target_level)
+
+
+def floor_band(level):
+    above = [s for s in storey_levels if s.Elevation >= level.Elevation + STOREY_MIN_HEIGHT]
+    top = above[0].Elevation - LEVEL_TOLERANCE if above else float("inf")
+    return level.Elevation - FLOOR_BAND_BELOW, top
+
+
+floor_bands = [(floor, floor_band(floor)) for floor in selected_floors]
+band_included_from = {}            # linked level name -> count
+for item in items:
+    if item.in_selection or item.point is None:
+        continue
+    for floor, (low, high) in floor_bands:
+        if low <= item.point.Z < high:
+            item.in_selection = True
+            item.band_included = True
+            item.target_level = floor
+            name = item.level.Name if item.level is not None else u"no level"
+            band_included_from[name] = band_included_from.get(name, 0) + 1
+            break
 
 for item in items:
     if item.target_level is not None:
@@ -1011,11 +1051,38 @@ try:
                         FilteredElementCollector(doc, active_view.Id).OfClass(FamilyInstance))
         if any(id_value(r[1].Id) in shown_ids for r in existing):
             plan_level_id = id_value(active_view.GenLevel.Id)
+            crop = active_view.CropBox if active_view.CropBoxActive else None
+            crop_inverse = crop.Transform.Inverse if crop is not None else None
+
+            def inside_crop(point):
+                # outside the crop region a symbol is "not visible" for Revit too - ignore those
+                if crop is None:
+                    return True
+                local = crop_inverse.OfPoint(point)
+                return crop.Min.X <= local.X <= crop.Max.X and crop.Min.Y <= local.Y <= crop.Max.Y
+
+            fixture_cells = {}
+            for fixture_item in items:
+                if fixture_item.point is not None:
+                    fixture_cells.setdefault((int(math.floor(fixture_item.point.X / EXISTING_RADIUS)),
+                                              int(math.floor(fixture_item.point.Y / EXISTING_RADIUS))),
+                                             []).append(fixture_item.point)
+
+            def near_fixture(point):
+                cx, cy = int(math.floor(point.X / EXISTING_RADIUS)), int(math.floor(point.Y / EXISTING_RADIUS))
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        for other in fixture_cells.get((cx + dx, cy + dy), []):
+                            if point_distance(point, other, True) <= EXISTING_RADIUS:
+                                return True
+                return False
+
             kept = []
             for record in existing:
                 model_symbol = record[2] is None or record[2] == ElementId.InvalidElementId
                 if model_symbol and id_value(record[1].Id) not in shown_ids \
-                        and record_level_id(record) == plan_level_id:
+                        and record_level_id(record) == plan_level_id \
+                        and inside_crop(record[0]) and near_fixture(record[0]):
                     hidden_records.append(record)
                 else:
                     kept.append(record)
@@ -1028,9 +1095,9 @@ eligible = []
 for item in items:
     if item.point is None:
         item.status = "noloc"
-    elif item.level is None:
+    elif item.level is None and not item.in_selection:
         item.status = "no_level"
-    elif id_value(item.level.Id) not in selected_level_ids:
+    elif not item.in_selection:
         item.status = "outside"
     elif item.target_level is None:
         item.status = "no_host_level"
@@ -1172,7 +1239,7 @@ for reference in picked_refs:
         continue
 
 STATUS_TEXT = {
-    "outside": u"its linked level was not selected",
+    "outside": u"it is on another floor (not selected)",
     "noloc": u"no insertion point",
     "no_level": u"no level found in the link",
     "no_host_level": u"no matching level in this model",
@@ -1234,8 +1301,7 @@ to_align = [i for i in items if i.status == "align"]
 # any status) lies within 350 mm of it in plan on the same floor.
 # -----------------------------------------------------------------------------
 selected_host_level_ids = set(id_value(i.target_level.Id) for i in items
-                              if i.target_level is not None and i.level is not None
-                              and id_value(i.level.Id) in selected_level_ids)
+                              if i.target_level is not None and i.in_selection)
 
 
 linked_grid = {}
@@ -1309,11 +1375,7 @@ outside = [i for i in items if i.status == "outside"]
 no_view = [i for i in items if i.status == "no_view"]
 no_location = [i for i in items if i.status in ("noloc", "no_level")]
 no_host_level = [i for i in items if i.status == "no_host_level"]
-selected_items = [
-    item for item in items
-    if item.level is not None
-    and id_value(item.level.Id) in selected_level_ids
-]
+selected_items = [item for item in items if item.in_selection]
 selected_group_keys = sorted(
     set(item.key for item in selected_items),
     key=lambda key: (key[0].lower(), key[1].lower())
@@ -1735,9 +1797,11 @@ class PreviewWindow(object):
         self.target = (0.0, 0.0, 0.0)
         self.width = 100.0
         self.extent = 100.0
-        if self.markers:
-            box = bounds_of(self.markers, 0.0)
-            zs = [m.z for m in self.markers]
+        # the building = the linked fixtures (far-away stray symbols must not shrink the view)
+        self.fixture_markers = [m for m in self.markers if m.item is not None] or list(self.markers)
+        if self.fixture_markers:
+            box = bounds_of(self.fixture_markers, 0.0)
+            zs = [m.z for m in self.fixture_markers]
             self.extent = max(box[2] - box[0], box[3] - box[1], max(zs) - min(zs), 30.0)
         # orientation of the open Revit plan, so the preview looks the same
         self.view_yaw = -math.pi / 2
@@ -2103,13 +2167,18 @@ class PreviewWindow(object):
             return list(self.markers)
         return [m for m in self.markers if m.level_id == self.level_key]
 
+    def level_fixtures(self):
+        """Linked fixtures of the current level (used to frame the view)."""
+        members = [m for m in self.level_markers() if m.item is not None]
+        return members or self.level_markers()
+
     # ---- 3D context: floor slab + walls of the loaded links ------------
     def get_walls(self):
         if self.walls is None:
             self.walls = []
             if self.markers:
                 try:
-                    self.walls = scan_walls(bounds_of(self.markers, 15.0 * FEET_PER_M))
+                    self.walls = scan_walls(bounds_of(self.fixture_markers, 15.0 * FEET_PER_M))
                 except Exception:
                     self.walls = []
         return self.walls
@@ -2145,7 +2214,7 @@ class PreviewWindow(object):
         margin = 3.0 * FEET_PER_M
         if level_key == "ALL":
             by_level = {}
-            for marker in self.markers:
+            for marker in self.fixture_markers:
                 if marker.level_id in self.levels_by_id:
                     by_level.setdefault(marker.level_id, []).append(marker)
             for lid, members in by_level.items():
@@ -2154,7 +2223,7 @@ class PreviewWindow(object):
                 add_slab(slab, xmin, ymin, xmax, ymax, z - 0.8, z - 0.15)
         else:
             level = self.levels_by_id.get(level_key)
-            members = self.level_markers()
+            members = self.level_fixtures()
             if level is None or not members:
                 return None
             z = level.Elevation
@@ -2198,7 +2267,7 @@ class PreviewWindow(object):
             level.Name if level is not None else u"All selected levels", len(self.shown))
         self.fill_list()
         if fit:
-            self.fit(in_level)
+            self.fit()
         else:
             self.layer.InvalidateVisual()
 
@@ -2399,7 +2468,7 @@ class PreviewWindow(object):
         self.layer.InvalidateVisual()
 
     def fit(self, members=None):
-        members = members if members is not None else self.level_markers()
+        members = members if members is not None else self.level_fixtures()
         if not members:
             self.apply_camera()
             return
@@ -2560,6 +2629,8 @@ class PreviewWindow(object):
                 length = math.sqrt(vx * vx + vy * vy)
                 if length < 1.0:
                     continue
+                if length < 150.0:
+                    continue                    # too far out to read: line only, no bubbles
                 vx, vy = vx / length, vy / length
                 label = formatted(name, 10.0, "grid", True)
                 for (px, py), sign in ((pa, 1.0), (pb, -1.0)):
@@ -2715,8 +2786,12 @@ class PreviewWindow(object):
         ]
         lines.append(u"Aligning only moves the symbol: circuit membership is checked before and after each "
                      u"move and the move is undone if it would change a circuit. Wires stay connected.")
+        if band_included_from:
+            lines.append(u"Included because they sit on the selected floor although the link assigns them "
+                         u"to another level: {}.".format(u", ".join(
+                             u"{} x {}".format(n, name) for name, n in sorted(band_included_from.items()))))
         if outside:
-            lines.append(u"{} skipped: outside the selected levels.".format(len(outside)))
+            lines.append(u"{} skipped: on other floors (not selected).".format(len(outside)))
         if no_view:
             lines.append(u"{} skipped: no plan view is assigned to the matching level.".format(
                 len(no_view)))
@@ -3142,8 +3217,11 @@ summary = [
     u"{} existing symbol(s) with no linked fixture deleted ({} found).".format(len(deleted), len(orphans)),
     u"Aligned symbols were only moved: type, parameters and circuits unchanged.",
 ]
+if band_included_from:
+    summary.append(u"Included because they sit on the selected floor (assigned to another linked level): {}."
+                   .format(u", ".join(u"{} x {}".format(n, name) for name, n in sorted(band_included_from.items()))))
 if outside:
-    summary.append(u"{} skipped: outside the selected levels.".format(len(outside)))
+    summary.append(u"{} skipped: on other floors (not selected).".format(len(outside)))
 if no_view:
     summary.append(u"{} skipped: no plan view is assigned to the matching level.".format(
         len(no_view)))
