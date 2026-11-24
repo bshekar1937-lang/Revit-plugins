@@ -403,6 +403,12 @@ def place_in_model(link, transform, fixture, symbol, point, levels,
             return doc.Create.NewFamilyInstance(point, symbol, level, StructuralType.NonStructural)
         except Exception as error:
             errors.append(str(error))
+        try:
+            # a2) same, on the level plane itself; the height is corrected afterwards
+            return doc.Create.NewFamilyInstance(XYZ(point.X, point.Y, level.Elevation), symbol,
+                                                level, StructuralType.NonStructural)
+        except Exception as error:
+            errors.append(str(error))
 
     # b) face-based families: host on the same linked face as the fixture
     try:
@@ -1711,6 +1717,19 @@ watt_written = 0
 watt_missing_target = 0
 created_types = []
 failed = []
+placement_notes = []   # [linked type, linked id, note] - placed, with a remark
+
+
+def closest_symbol(key):
+    """Best-named existing type of the chosen family (any score), else the first."""
+    best, best_score = None, -1
+    for candidate in family_symbols:
+        score = match_score(type_name(candidate), key[0], key[1])
+        if score > best_score:
+            best, best_score = candidate, score
+    return best or base_symbol
+
+
 placed_per_type = {}
 type_watts = {}        # type-level wattage: symbol id -> set of values written
 
@@ -1773,11 +1792,20 @@ try:
             used_lower.add(name.lower())
             created_types.append(name)
         except Exception as error:
-            failed.append([u"{} : {}".format(*key), "", u"New type '{}' not created: {}".format(value, error)])
+            # e.g. the family is borrowed by another user (workshared model):
+            # still place a symbol, using the closest existing type
+            fallback = closest_symbol(key)
+            symbol_for[key] = fallback
+            placement_notes.append([u"{} : {}".format(*key), u"-",
+                                    u"new type '{}' could not be created ({}) - placed as existing type '{}'"
+                                    .format(value, error, type_name(fallback))])
 
     for symbol in symbol_for.values():
-        if not symbol.IsActive:
-            symbol.Activate()
+        try:
+            if not symbol.IsActive:
+                symbol.Activate()
+        except Exception:
+            pass
     doc.Regenerate()
 
     # align existing symbols within 350 mm: MOVE only (no type / parameter changes)
@@ -1841,8 +1869,15 @@ try:
         symbol = symbol_for.get(item.key)
         source_label = u"{} : {}".format(*item.key)
         if symbol is None:
-            failed.append([source_label, id_value(item.fixture.Id), "No 2D type available"])
-            continue
+            symbol = closest_symbol(item.key)
+            symbol_for[item.key] = symbol
+            try:
+                if not symbol.IsActive:
+                    symbol.Activate()
+                    doc.Regenerate()
+            except Exception:
+                pass
+        fid = id_value(item.fixture.Id)
         sub = SubTransaction(doc)
         sub.Start()
         try:
@@ -1855,23 +1890,43 @@ try:
                     link, transform, item.fixture, symbol, model_point(item),
                     levels, item.target_level
                 )
+        except Exception as error:
+            sub.RollBack()
+            failed.append([source_label, fid, u"Revit refused to place it: {}".format(error)])
+            continue
+
+        # Optional steps: a problem here is reported but NEVER removes the symbol.
+        def rotate_step():
             location = instance.Location
             if rotate and abs(item.rotation) > 1e-6 and isinstance(location, LocationPoint) \
                     and not is_face_hosted(instance):
                 origin = location.Point
                 ElementTransformUtils.RotateElement(
                     doc, instance.Id, Line.CreateBound(origin, origin + XYZ.BasisZ), item.rotation)
-            check_elevation(instance, item)
-            write_source_comments(instance, item)
-            apply_watts(instance, item)
+
+        for step_name, step in (
+                (u"rotation", rotate_step),
+                (u"elevation", lambda: check_elevation(instance, item)),
+                (u"comments", lambda: write_source_comments(instance, item)),
+                (u"wattage", lambda: apply_watts(instance, item))):
+            try:
+                step()
+            except Exception as error:
+                placement_notes.append([source_label, fid,
+                                        u"placed, but {} not set: {}".format(step_name, error)])
+        try:
             sub.Commit()
-            item.placed_id = instance.Id
-            placed += 1
-            label = type_name(symbol)
-            placed_per_type[label] = placed_per_type.get(label, 0) + 1
         except Exception as error:
-            sub.RollBack()
-            failed.append([source_label, id_value(item.fixture.Id), str(error)])
+            try:
+                sub.RollBack()
+            except Exception:
+                pass
+            failed.append([source_label, fid, u"Revit refused to place it: {}".format(error)])
+            continue
+        item.placed_id = instance.Id
+        placed += 1
+        label = type_name(symbol)
+        placed_per_type[label] = placed_per_type.get(label, 0) + 1
 
     if placed == 0 and not aligned and not deleted and not created_types:
         transaction.RollBack()
@@ -1910,6 +1965,9 @@ if conflicts:
                        title="Wattage is a TYPE parameter but the linked fixtures differ - make it an instance parameter")
 if failed:
     output.print_table(table_data=failed, columns=["Linked type", "Linked ID", "Reason"], title="Not placed")
+if placement_notes:
+    output.print_table(table_data=placement_notes[:1000], columns=["Linked type", "Linked ID", "Note"],
+                       title=u"Placed, with a note ({})".format(len(placement_notes)))
 report_picked()
 
 skipped_rows = []
@@ -1998,6 +2056,9 @@ if not view_based:
                        u"so they are visible in plan.".format(len(zero_rows), int(MIN_SYMBOL_LIFT * 304.8)))
 if failed:
     summary.append(u"{} problem(s) - see the output window.".format(len(failed)))
+if placement_notes:
+    summary.append(u"{} note(s): symbols placed but e.g. a new type, rotation or wattage could not be "
+                   u"set - see 'Placed, with a note' in the output window.".format(len(placement_notes)))
 if off_geometry_ids:
     summary.append(u"{} fixture(s) have their insertion point away from their geometry - "
                    u"symbols go to the fixture centre (older symbols beside them are aligned "
@@ -2027,7 +2088,7 @@ def reason_group(item):
     if item.status == "place":
         for row in failed:
             if row[1] == id_value(item.fixture.Id):
-                return u"placing failed: " + row[2][:80]
+                return u"placing failed: " + row[2][:250]
     return None
 
 
