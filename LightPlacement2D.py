@@ -1333,12 +1333,35 @@ class Orphan(object):
         self.circuits = connected_circuit_ids(record[1])
 
 
+# Only symbols INSIDE this link's footprint (its fixtures + 5 m) can be
+# "without a linked fixture": symbols of other buildings / blocks that this
+# link does not cover are left completely alone (never listed, never deleted).
+FOOTPRINT_MARGIN = 5.0 * 1000.0 / 304.8
+_link_points = [i.point for i in items if i.point is not None]
+if _link_points:
+    link_footprint = (min(p.X for p in _link_points) - FOOTPRINT_MARGIN,
+                      min(p.Y for p in _link_points) - FOOTPRINT_MARGIN,
+                      max(p.X for p in _link_points) + FOOTPRINT_MARGIN,
+                      max(p.Y for p in _link_points) + FOOTPRINT_MARGIN)
+else:
+    link_footprint = None
+
+
+def in_link_footprint(point):
+    if link_footprint is None:
+        return False
+    return link_footprint[0] <= point.X <= link_footprint[2] and \
+        link_footprint[1] <= point.Y <= link_footprint[3]
+
+
 orphans = []
 level_names = dict((id_value(level.Id), level.Name) for level in levels)
 for record in existing:
     try:
         if id_value(record[1].Id) in used_existing:
             continue
+        if not in_link_footprint(record[0]):
+            continue                       # another building / block: not ours to judge
         level_id = record_level_id(record)
         if level_id not in selected_host_level_ids:
             continue
@@ -1352,6 +1375,8 @@ for record in existing:
         continue
 for record in tilted_records + hidden_records:
     try:
+        if not in_link_footprint(record[0]):
+            continue
         level_id = record_level_id(record)
         if level_id not in selected_host_level_ids:
             continue
@@ -2909,6 +2934,7 @@ watt_missing_target = 0
 created_types = []
 failed = []
 placement_notes = []   # [linked type, linked id, note] - placed, with a remark
+position_fixed = set()  # linked ids whose new symbol Revit put elsewhere (moved onto the fixture)
 
 
 def closest_symbol(key):
@@ -3095,11 +3121,25 @@ try:
                 ElementTransformUtils.RotateElement(
                     doc, instance.Id, Line.CreateBound(origin, origin + XYZ.BasisZ), item.rotation)
 
+        def position_step():
+            # whatever the family's placement rules did: the symbol's insertion
+            # point must sit EXACTLY on the linked fixture in plan
+            location = instance.Location
+            if isinstance(location, LocationPoint):
+                current = location.Point
+                dx, dy = item.point.X - current.X, item.point.Y - current.Y
+                if abs(dx) > ALIGN_TOLERANCE or abs(dy) > ALIGN_TOLERANCE:
+                    ElementTransformUtils.MoveElement(doc, instance.Id, XYZ(dx, dy, 0.0))
+                    doc.Regenerate()
+                    position_fixed.add(fid)
+
         for step_name, step in (
+                (u"position", position_step),
                 (u"rotation", rotate_step),
                 (u"elevation", lambda: check_elevation(instance, item)),
                 (u"comments", lambda: write_source_comments(instance, item)),
-                (u"wattage", lambda: apply_watts(instance, item))):
+                (u"wattage", lambda: apply_watts(instance, item)),
+                (u"position check", position_step)):
             try:
                 step()
             except Exception as error:
@@ -3250,6 +3290,9 @@ if not view_based:
                        u"so they are visible in plan.".format(len(zero_rows), int(MIN_SYMBOL_LIFT * 304.8)))
 if failed:
     summary.append(u"{} problem(s) - see the output window.".format(len(failed)))
+if position_fixed:
+    summary.append(u"{} symbol(s) were put off-position by Revit's placement and were moved exactly "
+                   u"onto their linked fixture.".format(len(position_fixed)))
 if placement_notes:
     summary.append(u"{} note(s): symbols placed but e.g. a new type, rotation or wattage could not be "
                    u"set - see 'Placed, with a note' in the output window.".format(len(placement_notes)))
