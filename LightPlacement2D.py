@@ -975,6 +975,55 @@ def on_item_floor(record, item):
     return abs(point.Z - item.point.Z) < 1500.0 / 304.8
 
 
+def record_level_id(record):
+    point, instance, owner_view_id = record[0], record[1], record[2]
+    if owner_view_id is not None and owner_view_id != ElementId.InvalidElementId:
+        try:
+            view = doc.GetElement(owner_view_id)
+            if isinstance(view, ViewPlan) and view.GenLevel is not None:
+                return id_value(view.GenLevel.Id)
+        except Exception:
+            pass
+        return None
+    try:
+        level_id = instance.LevelId
+        if level_id is not None and level_id != ElementId.InvalidElementId:
+            return id_value(level_id)
+    except Exception:
+        pass
+    level = level_for(point.Z, levels)
+    return id_value(level.Id) if level is not None else None
+
+
+# -----------------------------------------------------------------------------
+# Symbols the open plan does NOT show (wrong height, view filter, closed
+# workset, other phase / design option ...) must not count as "this fixture
+# already has a symbol" - the fixture would stay empty in the plan. On the
+# open plan's level only symbols that plan really shows count; the others are
+# listed on the "No linked fixture" tab (marked) so they can be deleted.
+# Only applied when the open plan shows the chosen family at all.
+# -----------------------------------------------------------------------------
+hidden_records = []
+try:
+    if isinstance(active_view, ViewPlan) and not active_view.IsTemplate \
+            and active_view.GenLevel is not None and not view_based:
+        shown_ids = set(id_value(e.Id) for e in
+                        FilteredElementCollector(doc, active_view.Id).OfClass(FamilyInstance))
+        if any(id_value(r[1].Id) in shown_ids for r in existing):
+            plan_level_id = id_value(active_view.GenLevel.Id)
+            kept = []
+            for record in existing:
+                model_symbol = record[2] is None or record[2] == ElementId.InvalidElementId
+                if model_symbol and id_value(record[1].Id) not in shown_ids \
+                        and record_level_id(record) == plan_level_id:
+                    hidden_records.append(record)
+                else:
+                    kept.append(record)
+            existing = kept
+except Exception:
+    hidden_records = []
+
+
 eligible = []
 for item in items:
     if item.point is None:
@@ -1189,26 +1238,6 @@ selected_host_level_ids = set(id_value(i.target_level.Id) for i in items
                               and id_value(i.level.Id) in selected_level_ids)
 
 
-def record_level_id(record):
-    point, instance, owner_view_id = record[0], record[1], record[2]
-    if owner_view_id is not None and owner_view_id != ElementId.InvalidElementId:
-        try:
-            view = doc.GetElement(owner_view_id)
-            if isinstance(view, ViewPlan) and view.GenLevel is not None:
-                return id_value(view.GenLevel.Id)
-        except Exception:
-            pass
-        return None
-    try:
-        level_id = instance.LevelId
-        if level_id is not None and level_id != ElementId.InvalidElementId:
-            return id_value(level_id)
-    except Exception:
-        pass
-    level = level_for(point.Z, levels)
-    return id_value(level.Id) if level is not None else None
-
-
 linked_grid = {}
 for item in items:
     if item.point is not None:
@@ -1255,13 +1284,16 @@ for record in existing:
         orphans.append(orphan)
     except Exception:
         continue
-for record in tilted_records:
+for record in tilted_records + hidden_records:
     try:
         level_id = record_level_id(record)
         if level_id not in selected_host_level_ids:
             continue
         orphan = Orphan(record)
-        orphan.label += u"  (tilted - not shown in plan)"
+        if any(record is r for r in hidden_records):
+            orphan.label += u"  (not visible in this plan)"
+        else:
+            orphan.label += u"  (tilted - not shown in plan)"
         orphan.tilted = True
         orphan.level_name = level_names.get(level_id, u"-")
         orphan.level_id = level_id
@@ -2261,8 +2293,9 @@ class PreviewWindow(object):
                 (u"Element ID", str(marker.ident)),
                 (u"Level", orphan.level_name),
                 (u"Circuit", u"connected" if orphan.circuits else u"-"),
-                (u"Result", u"Lies on a sloped / vertical face - plan views cannot show it. A flat symbol "
-                            u"is placed instead; delete this one on the 'No linked fixture' tab."
+                (u"Result", u"The plan cannot show this symbol (sloped face, wrong height, filter or "
+                            u"workset), so it does not count - a visible symbol is placed on the fixture "
+                            u"instead. Delete this one on the 'No linked fixture' tab."
                  if tilted else
                  u"No linked fixture within 350 mm. Deleted only if you tick it on the "
                  u"'No linked fixture' tab."),
@@ -3142,6 +3175,11 @@ if failed:
 if placement_notes:
     summary.append(u"{} note(s): symbols placed but e.g. a new type, rotation or wattage could not be "
                    u"set - see 'Placed, with a note' in the output window.".format(len(placement_notes)))
+if hidden_records:
+    summary.append(u"{} existing symbol(s) on this level are NOT visible in the open plan (wrong height, "
+                   u"filter, workset ...) - they were ignored and visible symbols placed. They are listed "
+                   u"on the 'No linked fixture' tab (marked 'not visible') to delete; reconnect circuits "
+                   u"to the new symbols if needed.".format(len(hidden_records)))
 if tilted_records:
     summary.append(u"{} existing symbol(s) lie on a sloped / vertical face, so plan views cannot show "
                    u"them - they were ignored and flat symbols placed. They are listed on the "
