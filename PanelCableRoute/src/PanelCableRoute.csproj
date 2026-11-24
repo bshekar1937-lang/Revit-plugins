@@ -1,0 +1,117 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Panel Cable Route Pro, as a standalone Revit add-in. No pyRevit, no Dynamo.
+
+    Pick the Revit version to build against. 2023 and 2024 run on .NET
+    Framework 4.8; 2025 and later run on .NET 8. The target framework and the
+    Revit reference path both follow from this one property:
+
+        dotnet build src/PanelCableRoute.csproj -c Release -p:RevitVersion=2025
+
+    Visual Studio builds the default below unless you pass the property.
+  -->
+  <PropertyGroup>
+    <RevitVersion Condition="'$(RevitVersion)' == ''">2025</RevitVersion>
+    <RevitApiDir Condition="'$(RevitApiDir)' == ''">C:\Program Files\Autodesk\Revit $(RevitVersion)</RevitApiDir>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <TargetFramework Condition="'$(RevitVersion)' &gt;= '2025'">net8.0-windows</TargetFramework>
+    <TargetFramework Condition="'$(RevitVersion)' &lt; '2025'">net48</TargetFramework>
+    <OutputType>Library</OutputType>
+    <UseWPF>true</UseWPF>
+    <PlatformTarget>x64</PlatformTarget>
+    <!-- Revit loads one assembly; keep the name steady across versions. -->
+    <AssemblyName>PanelCableRoute</AssemblyName>
+    <RootNamespace>PanelCableRoute</RootNamespace>
+    <!--
+      C# 7.3 is the highest version .NET Framework 4.8 projects get by
+      default. Pinning it here means code written for Revit 2025 cannot
+      quietly use syntax that will not build for Revit 2023.
+    -->
+    <LangVersion>7.3</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <Version>1.0.0</Version>
+    <Company>Revit-plugins</Company>
+    <Product>Panel Cable Route Pro</Product>
+    <Description>Panel-to-panel cable tray route lengths for voltage-drop calculations.</Description>
+    <!-- Revit ships its own copies of these; never copy them next to ours. -->
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <DefineConstants>$(DefineConstants);REVIT$(RevitVersion)</DefineConstants>
+  </PropertyGroup>
+
+  <!--
+    ElementId.IntegerValue was removed in Revit 2026; ElementId.Value is
+    there from 2024. One define keeps the choice in one place.
+  -->
+  <PropertyGroup Condition="'$(RevitVersion)' &gt;= '2024'">
+    <DefineConstants>$(DefineConstants);REVIT_ELEMENTID_VALUE</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="App.cs" />
+    <Compile Include="Commands\PanelRouteCommand.cs" />
+    <Compile Include="Core\*.cs" />
+    <Compile Include="Revit\*.cs" />
+    <Compile Include="UI\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Page Include="UI\SetupWindow.xaml" />
+    <Page Include="UI\ResultWindow.xaml" />
+  </ItemGroup>
+
+  <!--
+    Revit's own assemblies. Private=false keeps them out of the output: Revit
+    already has them loaded, and shipping a second copy causes type-identity
+    errors at run time.
+  -->
+  <ItemGroup>
+    <Reference Include="RevitAPI">
+      <HintPath>$(RevitApiDir)\RevitAPI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="RevitAPIUI">
+      <HintPath>$(RevitApiDir)\RevitAPIUI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <Target Name="WarnWithoutRevit" BeforeTargets="ResolveAssemblyReferences">
+    <Warning Condition="!Exists('$(RevitApiDir)\RevitAPI.dll')"
+             Text="RevitAPI.dll was not found in $(RevitApiDir). Pass -p:RevitApiDir=... with the folder that holds RevitAPI.dll, or -p:RevitVersion=... for the version you have installed." />
+  </Target>
+
+  <!--
+    Deploy to the current user's add-ins folder after a build on Windows.
+    Pass -p:DeployAddin=false to skip it.
+  -->
+  <PropertyGroup>
+    <DeployAddin Condition="'$(DeployAddin)' == ''">true</DeployAddin>
+    <AddinFolder>$(AppData)\Autodesk\Revit\Addins\$(RevitVersion)</AddinFolder>
+  </PropertyGroup>
+
+  <Target Name="DeployToRevit" AfterTargets="Build"
+          Condition="'$(OS)' == 'Windows_NT' And '$(DeployAddin)' == 'true'">
+    <MakeDir Directories="$(AddinFolder)\PanelCableRoute" />
+    <Copy SourceFiles="$(TargetPath)"
+          DestinationFolder="$(AddinFolder)\PanelCableRoute" />
+    <Copy SourceFiles="@(IntermediateAssembly->'%(RootDir)%(Directory)%(Filename).pdb')"
+          DestinationFolder="$(AddinFolder)\PanelCableRoute"
+          Condition="Exists('$(TargetDir)$(TargetName).pdb')"
+          ContinueOnError="true" />
+    <Copy SourceFiles="PanelCableRoute.addin"
+          DestinationFolder="$(AddinFolder)" />
+    <Message Importance="high"
+             Text="Installed to $(AddinFolder). Restart Revit $(RevitVersion) to load it." />
+  </Target>
+
+</Project>

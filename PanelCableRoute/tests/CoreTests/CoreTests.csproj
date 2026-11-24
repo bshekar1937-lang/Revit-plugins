@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Tests for the Revit-free routing core. It builds on its own, with no Revit
+    assemblies and no NuGet packages, so the maths can be exercised anywhere.
+    Run it from the PanelCableRoute folder with:
+
+        dotnet run (project tests/CoreTests/CoreTests.csproj)
+
+    LangVersion is pinned to the same level as the add-in, so nothing can slip
+    in here that will not compile for .NET Framework 4.8 (Revit 2023 / 2024).
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>CoreTests</AssemblyName>
+    <RootNamespace>PanelCableRoute.CoreTests</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="..\..\src\Core\*.cs" />
+  </ItemGroup>
+
+</Project>

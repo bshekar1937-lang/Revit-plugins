@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Revit add-in manifest.
+
+  Revit reads this from either
+      %APPDATA%\Autodesk\Revit\Addins\<version>\        (just this user)
+      %PROGRAMDATA%\Autodesk\Revit\Addins\<version>\    (every user)
+
+  The Assembly path below is relative to the folder this file sits in, so the
+  manifest goes in the Addins folder and the DLL in the PanelCableRoute
+  subfolder next to it. The build target and install/Install.ps1 both do that.
+
+  Type is Application: the add-in adds its own ribbon tab and the button runs
+  the command. Revit must be restarted after the manifest is added or changed.
+-->
+<RevitAddIns>
+  <AddIn Type="Application">
+    <Name>Panel Cable Route Pro</Name>
+    <Assembly>PanelCableRoute\PanelCableRoute.dll</Assembly>
+    <AddInId>a9cdffe3-5636-4cb0-ba9d-94f08a9a22e6</AddInId>
+    <FullClassName>PanelCableRoute.App</FullClassName>
+    <VendorId>RVTP</VendorId>
+    <VendorDescription>Revit-plugins</VendorDescription>
+  </AddIn>
+</RevitAddIns>
