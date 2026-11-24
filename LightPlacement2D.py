@@ -17,7 +17,8 @@ __doc__ = (
 #     * types      : each linked "Family : Type" is matched to the closest
 #                    existing type name (spaces, dashes, case and word order
 #                    ignored); no match -> a new type in the selected family
-#     * position   : linked fixture insertion point, transformed to host coords
+#     * position   : the linked family's ORIGIN, transformed to host coords;
+#                    the symbol's origin is put exactly there (checked after placing)
 #     * existing   : if a symbol of the chosen 2D family (or one this tool placed)
 #                    is within 350 mm of the linked fixture on the same floor,
 #                    it counts as existing and is ALIGNED onto the linked
@@ -262,36 +263,27 @@ def plan_view_for_level(view_id, level):
     return None
 
 
-OFF_GEOMETRY_TOLERANCE = 50.0 / 304.8       # insertion point this far outside the geometry
-off_geometry_ids = set()                    # fixtures placed at their geometry centre
-
-
 def placement_of(fixture, transform, use_centre):
-    """Host point and rotation of a linked fixture.
-    Normally the insertion point. Some families (level / work-plane hosted
-    surface and wall lights) have their insertion point AWAY from their
-    geometry - the symbol then landed beside the fixture. When the insertion
-    point lies outside the fixture's own plan extent, the geometry centre is
-    used in plan (height stays the fixture's own)."""
-    location = fixture.Location
-    insertion = location.Point if isinstance(location, LocationPoint) else None
-    source = insertion
-    box = None
+    """Host point and rotation of a linked fixture: its FAMILY ORIGIN (the
+    instance's own placement point), transformed into this model. The
+    bounding-box centre is used only if a fixture has no origin at all."""
+    source = None
     try:
-        box = fixture.get_BoundingBox(None)
+        source = fixture.GetTransform().Origin          # the family origin
     except Exception:
-        box = None
-    if box is not None:
-        centre = (box.Min + box.Max) * 0.5
-        t = OFF_GEOMETRY_TOLERANCE
-        outside = insertion is not None and (
-            insertion.X < box.Min.X - t or insertion.X > box.Max.X + t or
-            insertion.Y < box.Min.Y - t or insertion.Y > box.Max.Y + t)
-        if use_centre or insertion is None or outside:
-            # keep the fixture's own height; only X / Y move to the centre
-            source = centre if insertion is None else XYZ(centre.X, centre.Y, insertion.Z)
-            if outside:
-                off_geometry_ids.add(id_value(fixture.Id))
+        source = None
+    if source is None:
+        location = fixture.Location
+        if isinstance(location, LocationPoint):
+            source = location.Point
+    if source is None or use_centre:
+        try:
+            box = fixture.get_BoundingBox(None)
+        except Exception:
+            box = None
+        if box is not None:
+            centre = (box.Min + box.Max) * 0.5
+            source = centre if source is None else XYZ(centre.X, centre.Y, source.Z)
     if source is None:
         return None, 0.0
     rotation = 0.0
@@ -2457,8 +2449,7 @@ class PreviewWindow(object):
             lines.append((u"Result", u"Not placed: " + SKIP_TEXT.get(item.status, item.status)))
         if item.watt_text:
             lines.append((u"Wattage", item.watt_text))
-        if id_value(item.fixture.Id) in off_geometry_ids:
-            lines.append((u"Position", u"fixture centre (its insertion point is away from its geometry)"))
+        lines.append((u"Position", u"linked family origin"))
         return lines
 
     def show_details(self, marker):
@@ -3224,6 +3215,27 @@ try:
                         return True
         return False
 
+    # Is the 2D family's DRAWING centred on its origin? If not, every symbol
+    # looks shifted although its origin sits exactly on the fixture origin.
+    drawing_offsets = []
+    try:
+        if isinstance(active_view, ViewPlan) and active_view.GenLevel is not None:
+            for item in to_place:
+                placed_id = getattr(item, "placed_id", None)
+                if placed_id is None or item.target_level is None \
+                        or item.target_level.Id != active_view.GenLevel.Id:
+                    continue
+                placed_instance = doc.GetElement(placed_id)
+                box = placed_instance.get_BoundingBox(active_view) if placed_instance is not None else None
+                if box is None or not isinstance(placed_instance.Location, LocationPoint):
+                    continue
+                centre = (box.Min + box.Max) * 0.5
+                drawing_offsets.append(point_distance(centre, placed_instance.Location.Point, True))
+                if len(drawing_offsets) >= 15:
+                    break
+    except Exception:
+        drawing_offsets = []
+
     coverage_missing = [item for item in items
                         if item.in_selection and item.point is not None and not has_symbol(item)]
     coverage_total = len([item for item in items if item.in_selection and item.point is not None])
@@ -3308,14 +3320,6 @@ if skipped_rows:
         columns=["Linked type", "Linked ID", "Host level", "Result", "Existing symbol (click)"],
         title=u"Linked fixtures that did NOT get a new symbol ({})".format(len(skipped_rows)))
 
-if off_geometry_ids:
-    rows_off = [[u"{} : {}".format(*i.key), id_value(i.fixture.Id), why(i)]
-                for i in items if id_value(i.fixture.Id) in off_geometry_ids]
-    output.print_table(
-        table_data=rows_off[:1000], columns=["Linked type", "Linked ID", "Result"],
-        title=u"Insertion point away from the fixture geometry ({}) - symbol placed at the "
-              u"fixture's centre instead".format(len(rows_off)))
-
 zero_rows = []
 for item in items:
     above = height_above_level(item)
@@ -3378,6 +3382,15 @@ if not view_based:
                        u"so they are visible in plan.".format(len(zero_rows), int(MIN_SYMBOL_LIFT * 304.8)))
 if failed:
     summary.append(u"{} problem(s) - see the output window.".format(len(failed)))
+if drawing_offsets:
+    typical = sorted(drawing_offsets)[len(drawing_offsets) // 2] * 304.8
+    if typical > 30.0:
+        summary.append(u"")
+        summary.append(u"CHECK YOUR 2D FAMILY: its drawing is about {} mm away from the family origin. "
+                       u"Each symbol's ORIGIN sits exactly on the linked fixture's origin, so the drawing "
+                       u"looks shifted. Open '{}' in the Family Editor, move the graphics so they are "
+                       u"centred where the two centre reference planes cross, load it back (overwrite) "
+                       u"and every symbol moves onto its fixture.".format(int(round(typical)), family.Name))
 if coverage_missing:
     summary.append(u"")
     summary.append(u"COVERAGE: {} of {} linked fixture(s) on the selected floor(s) still have NO symbol "
@@ -3401,10 +3414,6 @@ if tilted_records:
     summary.append(u"{} existing symbol(s) lie on a sloped / vertical face, so plan views cannot show "
                    u"them - they were ignored and flat symbols placed. They are listed on the "
                    u"'No linked fixture' tab (marked 'tilted') to delete.".format(len(tilted_records)))
-if off_geometry_ids:
-    summary.append(u"{} fixture(s) have their insertion point away from their geometry - "
-                   u"symbols go to the fixture centre (older symbols beside them are aligned "
-                   u"when 'Align existing' is ticked).".format(len(off_geometry_ids)))
 if picked_ids or picked_other_link:
     summary.append(u"Your selected linked fixture(s): see 'why' table in the output window.")
     for item in items:
