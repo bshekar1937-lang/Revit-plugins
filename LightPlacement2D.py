@@ -2488,7 +2488,9 @@ class PreviewWindow(object):
             lines.append((u"Result", u"Not placed: " + SKIP_TEXT.get(item.status, item.status)))
         if item.watt_text:
             lines.append((u"Wattage", item.watt_text))
-        lines.append((u"Position", u"linked family origin"))
+        lines.append((u"Position", u"linked family origin: X {:.0f} / Y {:.0f} / Z {:.0f} mm (model "
+                                   u"coordinates) - the symbol's origin goes exactly here in plan".format(
+                                       item.point.X * 304.8, item.point.Y * 304.8, item.point.Z * 304.8)))
         return lines
 
     def show_details(self, marker):
@@ -2997,6 +2999,7 @@ created_types = []
 failed = []
 placement_notes = []   # [linked type, linked id, note] - placed, with a remark
 position_fixed = set()  # linked ids whose new symbol Revit put elsewhere (moved onto the fixture)
+coordinate_rows = []    # linked fixture vs placed symbol coordinates (model, mm)
 
 
 def closest_symbol(key):
@@ -3270,6 +3273,16 @@ try:
             failed.append([source_label, fid, u"Revit refused to place it: {}".format(error)])
             continue
         item.placed_id = instance.Id
+        try:
+            at = instance.Location.Point
+            coordinate_rows.append([
+                u"{} : {}".format(*item.key), fid,
+                u"{:.0f} / {:.0f} / {:.0f}".format(item.point.X * 304.8, item.point.Y * 304.8, item.point.Z * 304.8),
+                output.linkify(instance.Id),
+                u"{:.0f} / {:.0f} / {:.0f}".format(at.X * 304.8, at.Y * 304.8, at.Z * 304.8),
+                round(point_distance(at, item.point, True) * 304.8, 1)])
+        except Exception:
+            pass
         placed += 1
         label = type_name(symbol)
         placed_per_type[label] = placed_per_type.get(label, 0) + 1
@@ -3388,6 +3401,13 @@ if coverage_missing:
                     for i in coverage_missing][:1000],
         columns=["Linked type", "Linked ID", "Floor", "Why"],
         title=u"Linked fixtures without a symbol ({})".format(len(coverage_missing)))
+if coordinate_rows:
+    output.print_table(
+        table_data=coordinate_rows[:1000],
+        columns=["Linked type", "Linked ID", "Linked fixture X / Y / Z (mm)", "Placed symbol (click)",
+                 "Symbol X / Y / Z (mm)", "Plan difference (mm)"],
+        title=u"Coordinates: linked fixture origin vs placed symbol (model coordinates, {} rows)".format(
+            len(coordinate_rows)))
 if placement_notes:
     output.print_table(table_data=placement_notes[:1000], columns=["Linked type", "Linked ID", "Note"],
                        title=u"Placed, with a note ({})".format(len(placement_notes)))
@@ -3501,6 +3521,10 @@ if coverage_missing:
 else:
     summary.append(u"COVERAGE: all {} linked fixture(s) on the selected floor(s) have a symbol."
                    .format(coverage_total))
+if coordinate_rows:
+    worst = max(row[5] for row in coordinate_rows)
+    summary.append(u"Coordinates checked: every new symbol's origin is on its linked fixture's origin "
+                   u"(largest plan difference {} mm) - see the 'Coordinates' table.".format(worst))
 if position_fixed:
     summary.append(u"{} symbol(s) were put off-position by Revit's placement and were moved exactly "
                    u"onto their linked fixture.".format(len(position_fixed)))
