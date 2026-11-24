@@ -262,17 +262,36 @@ def plan_view_for_level(view_id, level):
     return None
 
 
+OFF_GEOMETRY_TOLERANCE = 50.0 / 304.8       # insertion point this far outside the geometry
+off_geometry_ids = set()                    # fixtures placed at their geometry centre
+
+
 def placement_of(fixture, transform, use_centre):
-    """Host point (centre or insertion point) and rotation of a linked fixture."""
+    """Host point and rotation of a linked fixture.
+    Normally the insertion point. Some families (level / work-plane hosted
+    surface and wall lights) have their insertion point AWAY from their
+    geometry - the symbol then landed beside the fixture. When the insertion
+    point lies outside the fixture's own plan extent, the geometry centre is
+    used in plan (height stays the fixture's own)."""
     location = fixture.Location
     insertion = location.Point if isinstance(location, LocationPoint) else None
     source = insertion
-    if use_centre or source is None:
+    box = None
+    try:
         box = fixture.get_BoundingBox(None)
-        if box:
-            centre = (box.Min + box.Max) * 0.5
+    except Exception:
+        box = None
+    if box is not None:
+        centre = (box.Min + box.Max) * 0.5
+        t = OFF_GEOMETRY_TOLERANCE
+        outside = insertion is not None and (
+            insertion.X < box.Min.X - t or insertion.X > box.Max.X + t or
+            insertion.Y < box.Min.Y - t or insertion.Y > box.Max.Y + t)
+        if use_centre or insertion is None or outside:
             # keep the fixture's own height; only X / Y move to the centre
             source = centre if insertion is None else XYZ(centre.X, centre.Y, insertion.Z)
+            if outside:
+                off_geometry_ids.add(id_value(fixture.Id))
     if source is None:
         return None, 0.0
     rotation = 0.0
@@ -1871,6 +1890,14 @@ if skipped_rows:
         columns=["Linked type", "Linked ID", "Host level", "Result", "Existing symbol (click)"],
         title=u"Linked fixtures that did NOT get a new symbol ({})".format(len(skipped_rows)))
 
+if off_geometry_ids:
+    rows_off = [[u"{} : {}".format(*i.key), id_value(i.fixture.Id), why(i)]
+                for i in items if id_value(i.fixture.Id) in off_geometry_ids]
+    output.print_table(
+        table_data=rows_off[:1000], columns=["Linked type", "Linked ID", "Result"],
+        title=u"Insertion point away from the fixture geometry ({}) - symbol placed at the "
+              u"fixture's centre instead".format(len(rows_off)))
+
 zero_rows = []
 for item in items:
     above = height_above_level(item)
@@ -1930,6 +1957,10 @@ if not view_based:
                        u"so they are visible in plan.".format(len(zero_rows), int(MIN_SYMBOL_LIFT * 304.8)))
 if failed:
     summary.append(u"{} problem(s) - see the output window.".format(len(failed)))
+if off_geometry_ids:
+    summary.append(u"{} fixture(s) have their insertion point away from their geometry - "
+                   u"symbols go to the fixture centre (older symbols beside them are aligned "
+                   u"when 'Align existing' is ticked).".format(len(off_geometry_ids)))
 if picked_ids or picked_other_link:
     summary.append(u"Your selected linked fixture(s): see 'why' table in the output window.")
     for item in items:
