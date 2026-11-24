@@ -40,7 +40,9 @@ __doc__ = (
 # One transaction: a single Ctrl+Z undoes everything.
 # Model families are placed at each fixture's EXACT elevation: after placing or
 # moving, the symbol's real height is measured and corrected (offset parameter,
-# then vertical move) to within 1 mm. View-specific families
+# then vertical move) to within 1 mm. Fixtures at ZERO elevation from their
+# level get their symbol 10 mm above the level (MIN_SYMBOL_LIFT) - exactly on
+# the level it fell outside the plan view range. View-specific families
 # are placed in a plan view assigned to each selected level.
 # Revit 2023 - 2027, pyRevit (IronPython engine).
 # =============================================================================
@@ -85,6 +87,12 @@ choose_again = EXEC_PARAMS.config_mode   # True on Shift+Click
 
 DUPLICATE_TOLERANCE = 50.0 / 304.8          # 50 mm in feet
 ALIGN_TOLERANCE = 1.0 / 304.8               # 1 mm in feet
+LEVEL_TOLERANCE = 5.0 / 304.8               # 5 mm: "on the level" (absorbs link round-off)
+# Fixtures whose elevation from level is zero (or a hair below, from the link
+# transform round-off) produced symbols lying exactly ON / just UNDER the level
+# plane - outside the plan view range, so they never showed up. Model symbols
+# are therefore kept at least this far above their host level.
+MIN_SYMBOL_LIFT = 10.0 / 304.8              # 10 mm in feet
 ROTATION_TOLERANCE = math.radians(0.1)
 INVALID_NAME_CHARS = u"\\:{}[]|;<>?`~"
 TARGET_CATEGORIES = [
@@ -137,7 +145,7 @@ def level_for(z, levels):
     """Highest level at or below z (the fixture's own floor); else the lowest."""
     if not levels:
         return None
-    below = [level for level in levels if level.Elevation <= z + 1e-6]
+    below = [level for level in levels if level.Elevation <= z + LEVEL_TOLERANCE]
     return below[-1] if below else levels[0]
 
 
@@ -219,6 +227,26 @@ def target_point(item, view_based):
     if view_based and item.target_level is not None:
         return XYZ(item.point.X, item.point.Y, item.target_level.Elevation)
     return item.point
+
+
+def model_z(item):
+    """Height a MODEL symbol is placed at: the linked fixture's elevation, but
+    never on / below its host level (zero-elevation fixtures)."""
+    z = item.point.Z
+    if item.target_level is not None:
+        z = max(z, item.target_level.Elevation + MIN_SYMBOL_LIFT)
+    return z
+
+
+def model_point(item):
+    return XYZ(item.point.X, item.point.Y, model_z(item))
+
+
+def height_above_level(item):
+    """Linked fixture height above its host level in mm (None if unknown)."""
+    if item.point is None or item.target_level is None:
+        return None
+    return (item.point.Z - item.target_level.Elevation) * 304.8
 
 
 def plan_view_for_level(view_id, level):
@@ -314,12 +342,12 @@ def check_elevation(instance, item):
     """Model families only: correct and record any elevation mismatch."""
     if view_based:
         return
-    remaining = fix_elevation(instance, item.point.Z)
+    remaining = fix_elevation(instance, model_z(item))
     if remaining:
         actual = instance_z(instance)
         elevation_problems.append([
             u"{} : {}".format(*item.key), id_value(item.fixture.Id),
-            int(round(item.point.Z * 304.8)),
+            int(round(model_z(item) * 304.8)),
             int(round(actual * 304.8)) if actual is not None else "-",
         ])
 
@@ -730,8 +758,11 @@ class FixtureItem(object):
         self.fixture = fixture
         self.point, self.rotation = placement_of(fixture, transform, use_centre)
         self.watts, self.watt_text, self.watt_name = linked_wattage(fixture)
-        source_z = transform.Inverse.OfPoint(self.point).Z \
-            if self.point is not None else None
+        try:
+            source_z = fixture.Location.Point.Z      # link coordinates, no round-off
+        except Exception:
+            source_z = transform.Inverse.OfPoint(self.point).Z \
+                if self.point is not None else None
         self.level = fixture_level(
             fixture, linked_doc, link_levels, source_z
         )
@@ -935,7 +966,7 @@ def align_target(item):
     current = instance.Location.Point
     if is_view_specific(instance) or is_face_hosted(instance):
         return XYZ(item.point.X, item.point.Y, current.Z)
-    return item.point
+    return model_point(item)
 
 
 # existing symbol within 350 mm but not exactly on the linked fixture -> "align"
@@ -1682,7 +1713,7 @@ try:
                 )
             else:
                 instance = place_in_model(
-                    link, transform, item.fixture, symbol, item.point,
+                    link, transform, item.fixture, symbol, model_point(item),
                     levels, item.target_level
                 )
             location = instance.Location
@@ -1739,6 +1770,20 @@ if conflicts:
                        title="Wattage is a TYPE parameter but the linked fixtures differ - make it an instance parameter")
 if failed:
     output.print_table(table_data=failed, columns=["Linked type", "Linked ID", "Reason"], title="Not placed")
+zero_rows = []
+for item in items:
+    above = height_above_level(item)
+    if above is not None and above < MIN_SYMBOL_LIFT * 304.8:
+        zero_rows.append([u"{} : {}".format(*item.key), id_value(item.fixture.Id),
+                          item.target_level.Name, int(round(above)),
+                          item.status if item.status not in ("existing", "align")
+                          else u"{} (existing symbol {})".format(item.status, id_value(item.existing_id))])
+if zero_rows:
+    output.print_table(
+        table_data=zero_rows[:500],
+        columns=["Linked type", "Linked ID", "Host level", "Height above level (mm)", "Result"],
+        title=u"Zero-elevation fixtures ({}) - model symbols kept {} mm above the level so the "
+              u"plan view shows them".format(len(zero_rows), int(MIN_SYMBOL_LIFT * 304.8)))
 if elevation_problems:
     output.print_table(
         table_data=elevation_problems,
@@ -1779,6 +1824,9 @@ if not view_based:
     elif placed:
         summary.append(u"Elevation checked: every NEW symbol is at the linked fixture's "
                        u"elevation (within 1 mm).")
+    if zero_rows:
+        summary.append(u"{} zero-elevation fixture(s): symbols placed {} mm above the level "
+                       u"so they are visible in plan.".format(len(zero_rows), int(MIN_SYMBOL_LIFT * 304.8)))
 if failed:
     summary.append(u"{} problem(s) - see the output window.".format(len(failed)))
 forms.alert(u"\n".join(summary) + u"\n\nOne Ctrl+Z undoes everything.", title="Light Placement 2D")
