@@ -908,6 +908,7 @@ for record in existing:
     if item is not None and item.existing_id is None:
         item.existing_instance, item.existing_id = record[1], record[1].Id
         item.existing_distance = point_distance(record[0], item.point, True)
+        item.existing_how = u"Comments say it was placed for this fixture"
         item.status = "existing"
         used_existing.add(id_value(record[1].Id))
 
@@ -938,6 +939,7 @@ for distance, item, record in pairs:
         continue
     item.existing_instance, item.existing_id = record[1], record[1].Id
     item.existing_distance = distance
+    item.existing_how = u"nearest symbol within 350 mm"
     item.status = "existing"
     used_existing.add(instance_id)
 
@@ -980,6 +982,83 @@ for item in items:
             item.status = "align"
     except Exception:
         pass
+
+# -----------------------------------------------------------------------------
+# DIAGNOSE: linked fixtures picked before running (hover, Tab until the linked
+# fixture highlights, click) are explained one by one at the end.
+# -----------------------------------------------------------------------------
+picked_refs = []
+try:
+    picked_refs = list(uidoc.Selection.GetReferences())   # Revit 2023+
+except Exception:
+    picked_refs = []
+picked_ids = set()
+picked_other_link = []
+for reference in picked_refs:
+    try:
+        if reference.LinkedElementId == ElementId.InvalidElementId:
+            continue
+        if reference.ElementId != link.Id:
+            other = doc.GetElement(reference.ElementId)
+            picked_other_link.append(u"{} (ID {})".format(
+                other.Name if other is not None else u"?", id_value(reference.LinkedElementId)))
+            continue
+        picked_ids.add(id_value(reference.LinkedElementId))
+    except Exception:
+        continue
+
+STATUS_TEXT = {
+    "outside": u"its linked level was not selected",
+    "noloc": u"no insertion point",
+    "no_level": u"no level found in the link",
+    "no_host_level": u"no matching level in this model",
+    "no_view": u"no plan view on the matching level",
+}
+
+
+def why(item):
+    """Plain-language result for one linked fixture."""
+    fid = id_value(item.fixture.Id)
+    if item.status in STATUS_TEXT:
+        return u"NOT placed: " + STATUS_TEXT[item.status]
+    if item.status in ("existing", "align"):
+        text = u"NOT placed: symbol {} already counts for it ({}, {} mm away in plan)".format(
+            id_value(item.existing_id), getattr(item, "existing_how", u"?"),
+            int(round(getattr(item, "existing_distance", 0.0) * 304.8)))
+        if item.status == "align":
+            text += u" - aligned" if any(r[1] == fid for r in globals().get("aligned", [])) else u" - NOT aligned (align box off or move failed)"
+        return text
+    for row in globals().get("failed", []):
+        if row[1] == fid:
+            return u"FAILED: " + row[2]
+    if "failed" not in globals():
+        return u"would be placed (press Place in the preview)"
+    return u"placed"
+
+
+def report_picked():
+    if picked_ids or picked_other_link:
+        rows_pick = []
+        for item in items:
+            if id_value(item.fixture.Id) in picked_ids:
+                above = height_above_level(item)
+                rows_pick.append([u"{} : {}".format(*item.key), id_value(item.fixture.Id),
+                                  item.level.Name if item.level is not None else u"-",
+                                  int(round(above)) if above is not None else u"-",
+                                  why(item),
+                                  output.linkify(item.existing_id) if item.existing_id is not None else u"-"])
+        found = set(r[1] for r in rows_pick)
+        for missing in sorted(picked_ids - found):
+            rows_pick.append([u"-", missing, u"-", u"-",
+                              u"NOT read: not a Lighting Fixture category element, or a nested family", u"-"])
+        for text in picked_other_link:
+            rows_pick.append([u"-", text, u"-", u"-",
+                              u"NOT read: it is in ANOTHER link - Shift+Click the button to choose that link", u"-"])
+        output.print_table(
+            table_data=rows_pick,
+            columns=["Linked type", "Linked ID", "Linked level", "Height above level (mm)", "Result", "Blocking symbol (click)"],
+            title=u"Your selected linked fixture(s) - why")
+
 
 to_place = [i for i in items if i.status == "place"]
 already = [i for i in items if i.status == "existing"]
@@ -1575,6 +1654,7 @@ class PreviewWindow(object):
 
 preview = PreviewWindow()
 if not preview.show():
+    report_picked()       # still explain the selected linked fixtures
     script.exit()
 copy_watts = preview.copy_watts
 align_existing = getattr(preview, "align_existing", False)
@@ -1770,6 +1850,27 @@ if conflicts:
                        title="Wattage is a TYPE parameter but the linked fixtures differ - make it an instance parameter")
 if failed:
     output.print_table(table_data=failed, columns=["Linked type", "Linked ID", "Reason"], title="Not placed")
+report_picked()
+
+skipped_rows = []
+for item in items:
+    if item.status in ("place", "outside", "existing"):
+        continue          # "existing" = a symbol already sits on the fixture
+    skipped_rows.append([u"{} : {}".format(*item.key), id_value(item.fixture.Id),
+                         item.target_level.Name if item.target_level is not None else u"-",
+                         why(item),
+                         output.linkify(item.existing_id) if item.existing_id is not None else u"-"])
+for item in to_place:
+    reason = why(item)
+    if reason != u"placed":
+        skipped_rows.append([u"{} : {}".format(*item.key), id_value(item.fixture.Id),
+                             item.target_level.Name, reason, u"-"])
+if skipped_rows:
+    output.print_table(
+        table_data=skipped_rows[:1000],
+        columns=["Linked type", "Linked ID", "Host level", "Result", "Existing symbol (click)"],
+        title=u"Linked fixtures that did NOT get a new symbol ({})".format(len(skipped_rows)))
+
 zero_rows = []
 for item in items:
     above = height_above_level(item)
@@ -1829,4 +1930,11 @@ if not view_based:
                        u"so they are visible in plan.".format(len(zero_rows), int(MIN_SYMBOL_LIFT * 304.8)))
 if failed:
     summary.append(u"{} problem(s) - see the output window.".format(len(failed)))
+if picked_ids or picked_other_link:
+    summary.append(u"Your selected linked fixture(s): see 'why' table in the output window.")
+    for item in items:
+        if id_value(item.fixture.Id) in picked_ids:
+            summary.append(u"  ID {}: {}".format(id_value(item.fixture.Id), why(item)))
+    for text in picked_other_link:
+        summary.append(u"  {}: in ANOTHER link - Shift+Click the button to pick that link.".format(text))
 forms.alert(u"\n".join(summary) + u"\n\nOne Ctrl+Z undoes everything.", title="Light Placement 2D")
