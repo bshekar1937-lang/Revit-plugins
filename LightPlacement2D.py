@@ -1767,8 +1767,20 @@ try:
             circuits_before = connected_circuit_ids(instance)
             start = instance.Location.Point
             target = align_target(item)
+            was_pinned = False
+            try:
+                was_pinned = instance.Pinned
+                if was_pinned:
+                    instance.Pinned = False      # pinned symbols cannot be moved
+            except Exception:
+                pass
             ElementTransformUtils.MoveElement(doc, instance.Id, target - start)
             doc.Regenerate()
+            if was_pinned:
+                try:
+                    instance.Pinned = True
+                except Exception:
+                    pass
             end = instance.Location.Point
             if point_distance(end, target, True) > ALIGN_TOLERANCE:
                 raise Exception("Revit did not move it onto the linked fixture (hosted / constrained?)")
@@ -1968,4 +1980,50 @@ if picked_ids or picked_other_link:
             summary.append(u"  ID {}: {}".format(id_value(item.fixture.Id), why(item)))
     for text in picked_other_link:
         summary.append(u"  {}: in ANOTHER link - Shift+Click the button to pick that link.".format(text))
+# -----------------------------------------------------------------------------
+# Every linked fixture on the selected levels that still has NO symbol on it,
+# grouped by reason, so the popup alone explains what was skipped.
+# -----------------------------------------------------------------------------
+def reason_group(item):
+    if item.status in STATUS_TEXT:
+        return STATUS_TEXT[item.status]
+    if item.status == "align":
+        moved = any(r[1] == id_value(item.fixture.Id) for r in aligned)
+        if moved:
+            return None
+        how = getattr(item, "existing_how", u"")
+        if "Comments" in how:
+            return u"a symbol placed for it earlier is elsewhere and was NOT moved"
+        return u"another symbol within 350 mm was counted for it and was NOT moved"
+    if item.status == "place":
+        for row in failed:
+            if row[1] == id_value(item.fixture.Id):
+                return u"placing failed: " + row[2][:80]
+    return None
+
+
+groups_why = {}
+for item in items:
+    if item.status == "outside":
+        continue
+    reason = reason_group(item)
+    if reason:
+        groups_why.setdefault(reason, []).append(item)
+if groups_why:
+    summary.append(u"")
+    summary.append(u"STILL WITHOUT A SYMBOL ON THE FIXTURE:")
+    for reason, group in sorted(groups_why.items(), key=lambda kv: -len(kv[1])):
+        type_names = sorted(set(i.key[1] for i in group))
+        summary.append(u"- {} x {}  [{}{}]".format(
+            len(group), reason, u", ".join(type_names[:4]), u", ..." if len(type_names) > 4 else u""))
+    if any(u"NOT moved" in r for r in groups_why):
+        summary.append(u"  -> tick 'Align existing' in the preview (pinned symbols cannot move: unpin them), "
+                       u"or delete the stray symbol and run again.")
+    output.print_table(
+        table_data=[[u"{} : {}".format(*i.key), id_value(i.fixture.Id), reason,
+                     output.linkify(i.existing_id) if i.existing_id is not None else u"-"]
+                    for reason, group in groups_why.items() for i in group][:1000],
+        columns=["Linked type", "Linked ID", "Why no symbol", "Symbol counted for it (click)"],
+        title=u"Still without a symbol on the fixture ({})".format(sum(len(g) for g in groups_why.values())))
+
 forms.alert(u"\n".join(summary) + u"\n\nOne Ctrl+Z undoes everything.", title="Light Placement 2D")
