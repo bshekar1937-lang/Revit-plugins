@@ -541,13 +541,30 @@ def best_symbol(symbols, key):
     return (best, best_score) if best_score >= AUTO_MATCH else (None, best_score)
 
 
+def top_parent(instance):
+    parent = getattr(instance, "SuperComponent", None)
+    while parent is not None and getattr(parent, "SuperComponent", None) is not None:
+        parent = parent.SuperComponent
+    return parent
+
+
 def collect_groups(link_doc):
+    """Every linked light that needs a symbol. A light nested in another family
+    counts too - unless that family is itself a light (it gets the symbol)."""
+    lighting = int(BuiltInCategory.OST_LightingFixtures)
     result = {}
     for fixture in FilteredElementCollector(link_doc) \
             .OfCategory(BuiltInCategory.OST_LightingFixtures) \
             .OfClass(FamilyInstance):
-        if fixture.Symbol is None or fixture.SuperComponent is not None:
+        if fixture.Symbol is None:
             continue
+        parent = top_parent(fixture)
+        if parent is not None:
+            try:
+                if parent.Category is not None and id_value(parent.Category.Id) == lighting:
+                    continue
+            except Exception:
+                continue
         key = (fixture.Symbol.FamilyName, type_name(fixture.Symbol))
         result.setdefault(key, []).append(fixture)
     return result
@@ -1963,6 +1980,21 @@ class PreviewWindow(object):
             inner.Children.Add(text_block(title, 10, True, "#CBD5E1"))
             card.Child = inner
             cards.Children.Add(card)
+        if outside:
+            card = Border()
+            card.CornerRadius = CornerRadius(8)
+            card.Background = SolidColorBrush(Color.FromArgb(25, 255, 255, 255))
+            card.BorderBrush = brush("#64748B")
+            card.BorderThickness = Thickness(0, 0, 0, 3)
+            card.Padding = Thickness(14, 6, 14, 6)
+            card.Margin = Thickness(0, 0, 10, 0)
+            card.MinWidth = 120
+            card.ToolTip = u"Linked fixtures on floors you did not tick - choose 'All linked levels' to include them."
+            inner = StackPanel()
+            inner.Children.Add(text_block(str(len(outside)), 22, True, "#94A3B8"))
+            inner.Children.Add(text_block(u"ON OTHER FLOORS - NOT INCLUDED", 10, True, "#94A3B8"))
+            card.Child = inner
+            cards.Children.Add(card)
         header.Children.Add(cards)
         DockPanel.SetDock(header, Dock.Top)
         return header
@@ -3159,6 +3191,43 @@ try:
         label = type_name(symbol)
         placed_per_type[label] = placed_per_type.get(label, 0) + 1
 
+    # FINAL CHECK: every linked fixture on the selected floors must now have
+    # one of our symbols on it (within 350 mm in plan, on that floor)
+    doc.Regenerate()
+    not_counted = set(id_value(r[1].Id) for r in tilted_records + hidden_records)
+    cover_cells = {}
+    for candidate in FilteredElementCollector(doc).OfClass(FamilyInstance):
+        try:
+            candidate_symbol = candidate.Symbol
+            if candidate_symbol is None or not isinstance(candidate.Location, LocationPoint):
+                continue
+            if id_value(candidate.Id) in not_counted:
+                continue
+            ours = candidate_symbol.Family is not None and candidate_symbol.Family.Id == family.Id
+            if not ours and source_reference_from_comments(candidate)[1] is None:
+                continue
+            point = candidate.Location.Point
+            cover_cells.setdefault((int(math.floor(point.X / EXISTING_RADIUS)),
+                                    int(math.floor(point.Y / EXISTING_RADIUS))), []).append(point)
+        except Exception:
+            continue
+
+    def has_symbol(item):
+        cx = int(math.floor(item.point.X / EXISTING_RADIUS))
+        cy = int(math.floor(item.point.Y / EXISTING_RADIUS))
+        low, high = floor_band(item.target_level) if item.target_level is not None else (-1e9, 1e9)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for point in cover_cells.get((cx + dx, cy + dy), []):
+                    if point_distance(point, item.point, True) <= EXISTING_RADIUS and \
+                            (view_based or low - 3.0 <= point.Z < high + 3.0):
+                        return True
+        return False
+
+    coverage_missing = [item for item in items
+                        if item.in_selection and item.point is not None and not has_symbol(item)]
+    coverage_total = len([item for item in items if item.in_selection and item.point is not None])
+
     if placed == 0 and not aligned and not deleted and not created_types:
         transaction.RollBack()
     else:
@@ -3196,6 +3265,25 @@ if conflicts:
                        title="Wattage is a TYPE parameter but the linked fixtures differ - make it an instance parameter")
 if failed:
     output.print_table(table_data=failed, columns=["Linked type", "Linked ID", "Reason"], title="Not placed")
+if coverage_missing:
+    def coverage_reason(item):
+        if item.status in STATUS_TEXT:
+            return STATUS_TEXT[item.status]
+        for row in failed:
+            if row[1] == id_value(item.fixture.Id):
+                return row[2]
+        if item.status == "align" and not align_existing:
+            return u"its nearby symbol was not aligned ('Align existing' was off)"
+        if item.status in ("existing", "align"):
+            return u"the symbol counted for it ({}) is not on this floor any more".format(
+                id_value(item.existing_id))
+        return u"not placed (see 'Not placed')"
+    output.print_table(
+        table_data=[[u"{} : {}".format(*i.key), id_value(i.fixture.Id),
+                     i.target_level.Name if i.target_level is not None else u"-", coverage_reason(i)]
+                    for i in coverage_missing][:1000],
+        columns=["Linked type", "Linked ID", "Floor", "Why"],
+        title=u"Linked fixtures without a symbol ({})".format(len(coverage_missing)))
 if placement_notes:
     output.print_table(table_data=placement_notes[:1000], columns=["Linked type", "Linked ID", "Note"],
                        title=u"Placed, with a note ({})".format(len(placement_notes)))
@@ -3290,6 +3378,14 @@ if not view_based:
                        u"so they are visible in plan.".format(len(zero_rows), int(MIN_SYMBOL_LIFT * 304.8)))
 if failed:
     summary.append(u"{} problem(s) - see the output window.".format(len(failed)))
+if coverage_missing:
+    summary.append(u"")
+    summary.append(u"COVERAGE: {} of {} linked fixture(s) on the selected floor(s) still have NO symbol "
+                   u"- see 'Linked fixtures without a symbol' in the output window.".format(
+                       len(coverage_missing), coverage_total))
+else:
+    summary.append(u"COVERAGE: all {} linked fixture(s) on the selected floor(s) have a symbol."
+                   .format(coverage_total))
 if position_fixed:
     summary.append(u"{} symbol(s) were put off-position by Revit's placement and were moved exactly "
                    u"onto their linked fixture.".format(len(position_fixed)))
