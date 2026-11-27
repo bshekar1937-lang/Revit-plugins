@@ -3,8 +3,12 @@ __title__ = "Circuit Manager Pro"
 __doc__ = (
     "Give many fixtures their own circuit each, move or disconnect or delete "
     "circuits in bulk, and add or remove elements on a circuit - all from one "
-    "dialog. Every action is a separate Undo step."
+    "dialog. Every action is a separate Undo step. The panel stays open while "
+    "you keep working in Revit."
 )
+# Keep the IronPython engine alive after the script ends, so the panel's
+# buttons (Revit ExternalEvent handlers) keep working while it stays open.
+__persistentengine__ = True
 
 # =============================================================================
 # CIRCUIT MANAGER PRO  -  pyRevit script for Revit electrical circuits
@@ -34,7 +38,14 @@ __doc__ = (
 #               factor), cleaned of hidden spaces, deleted, or merged.
 #
 # Every action runs in its own Revit transaction, so each one can be undone
-# separately with Ctrl+Z after the dialog is closed.
+# separately with Ctrl+Z.
+#
+# MODELESS PANEL: the panel stays open while you work in Revit (select, draw,
+# change views, edit properties). Its buttons run through a Revit
+# ExternalEvent, so they wait until Revit is idle - finish or Esc any running
+# Revit command first. Lists refresh by themselves when you come back to the
+# panel after changing the model. Running the button again brings the open
+# panel to the front instead of opening a second one.
 #
 # HOW TO USE
 #   pyRevit: put this file in a pushbutton folder as script.py, e.g.
@@ -62,11 +73,13 @@ from System.Collections.Generic import List
 
 from Autodesk.Revit import DB
 from Autodesk.Revit.DB.Electrical import ElectricalSystem, ElectricalSystemType
+from Autodesk.Revit.UI import ExternalEvent, IExternalEventHandler
 from Autodesk.Revit.UI.Selection import ObjectType
 
 from System.Windows import FontWeights
 from System.Windows.Controls import ComboBoxItem, ListBoxItem
 from System.Windows.Media import BrushConverter, Brushes
+from System.Windows.Interop import WindowInteropHelper
 from System.Windows.Markup import XamlReader
 
 uidoc = __revit__.ActiveUIDocument   # provided by pyRevit / RevitPythonShell
@@ -1337,7 +1350,6 @@ STATE = {
     "lc_panel": None,
     "lc_down": True,
     "lc_deep": True,
-    "pending": None,          # "pick_fixtures" | "pick_circuits" | "add_elems"
 }
 
 
@@ -1345,9 +1357,40 @@ def log(msg):
     STATE["log"].append(msg)
 
 
-class CircuitManagerWindow(object):
+class ApiQueue(IExternalEventHandler):
+    """Runs the panel's jobs inside Revit's API context. A modeless window
+    may only touch the Revit API through an ExternalEvent."""
 
     def __init__(self):
+        self.jobs = []
+        self.event = None
+
+    def post(self, job):
+        self.jobs.append(job)
+        if self.event is not None:
+            self.event.Raise()
+
+    def Execute(self, uiapp):
+        jobs, self.jobs = self.jobs, []
+        for job in jobs:
+            try:
+                job(uiapp)
+            except Exception as ex:
+                log(u"Error: {0}".format(ex))
+
+    def GetName(self):
+        return "Circuit Manager Pro"
+
+
+WINDOW_KEY = "CircuitManagerPro.Window"
+
+
+class CircuitManagerWindow(object):
+
+    def __init__(self, queue):
+        self.queue = queue
+        self.closed = False
+        self.dirty = False
         self.win = XamlReader.Parse(XAML)
         f = self.win.FindName
         self.c = dict((n, f(n)) for n in [
@@ -1366,7 +1409,9 @@ class CircuitManagerWindow(object):
         self.lc = None
         self.lc_group_ids = {}
         self.busy = False
-        self.c["txtDoc"].Text = u"Project: {0}   -   each action is one Undo step".format(doc.Title)
+        self.doc_title = doc.Title
+        self.c["txtDoc"].Text = (u"Project: {0}   -   keep working in Revit while this panel is "
+                                 u"open   -   each action is one Undo step".format(doc.Title))
 
         self.fill_panel_combos()
         self.c["chkSkip"].IsChecked = STATE["skip"]
@@ -1405,23 +1450,111 @@ class CircuitManagerWindow(object):
         self.c["cmbEditCircuit"].SelectionChanged += self.safe(self.on_edit_circuit_changed)
         self.c["lstLcProject"].SelectionChanged += self.safe(self.on_lc_proj_sel)
 
+        # modeless plumbing
+        self.win.Activated += self.on_activated
+        self.win.Closed += self.on_closed
+        self._doc_changed = self.on_doc_changed       # keep one delegate to remove later
+        try:
+            __revit__.Application.DocumentChanged += self._doc_changed
+        except Exception:
+            self._doc_changed = None
+        try:
+            WindowInteropHelper(self.win).Owner = __revit__.MainWindowHandle
+        except Exception:
+            pass
+
     def safe(self, handler):
-        """Never let an error escape a WPF event (it could crash Revit)."""
+        """Queue a UI event to run inside Revit's API context. Errors are
+        logged, never thrown (an error escaping a WPF event can crash Revit)."""
         def run(sender, args):
-            if self.busy:
-                return
-            self.busy = True
+            if self.busy or self.closed:
+                return                    # events caused by our own list updates
+            self.queue.post(lambda uiapp: self.execute(handler, sender, args, uiapp))
+        return run
+
+    def execute(self, handler, sender, args, uiapp):
+        if self.closed or not self.doc_ok(uiapp):
+            return
+        self.busy = True
+        try:
+            handler(sender, args)
+        except Exception as ex:
+            log(u"Error: {0}".format(ex))
             try:
-                handler(sender, args)
-            except Exception as ex:
-                log(u"Error: {0}".format(ex))
+                self.refresh_log()
+            except Exception:
+                pass
+        finally:
+            self.busy = False
+
+    def doc_ok(self, uiapp):
+        """The panel works on the project it was opened in."""
+        try:
+            if not doc.IsValidObject:
+                self.win.Close()
+                return False
+            active = uiapp.ActiveUIDocument
+            if active is None or not active.Document.Equals(doc):
+                log(u"Circuit Manager Pro works on '{0}' - switch back to that project "
+                    u"and try again.".format(self.doc_title))
+                self.refresh_log()
+                return False
+        except Exception:
+            return False
+        return True
+
+    def on_doc_changed(self, sender, args):
+        try:
+            if args.GetDocument().Equals(doc):
+                self.dirty = True
+        except Exception:
+            pass
+
+    def on_activated(self, sender, args):
+        """Back in the panel after working in Revit: refresh stale lists."""
+        if self.dirty and not self.busy and not self.closed:
+            self.dirty = False
+            self.queue.post(lambda uiapp: self.execute(self.on_doc_refresh, None, None, uiapp))
+
+    def on_doc_refresh(self, s, e):
+        self.save_state()
+        self.fill_panel_combos()
+        self.refresh_all()
+        lcs = all_load_classifications()
+        self.fill_lc_project(lcs, self.lc["usage"] if self.lc else None)
+        self.fill_lc_target(lcs)
+
+    def on_closed(self, sender, args):
+        self.closed = True
+        try:
+            System.AppDomain.CurrentDomain.SetData(WINDOW_KEY, None)
+        except Exception:
+            pass
+        handler = self._doc_changed
+        if handler is not None:
+            def unhook(uiapp):
                 try:
-                    self.refresh_log()
+                    __revit__.Application.DocumentChanged -= handler
                 except Exception:
                     pass
-            finally:
-                self.busy = False
-        return run
+            self.queue.post(unhook)
+
+    def run_pick(self, func):
+        """Hide the panel, let the user pick in the model, show it again."""
+        self.save_state()
+        self.win.Hide()
+        try:
+            func()
+        finally:
+            self.win.Show()
+            self.win.Activate()
+        self.select_combo_tag(self.c["cmbFilterPanel"], STATE["filter_panel"])
+        self.c["txtSearch"].Text = STATE["search"]
+        self.fill_fixtures()
+        self.fill_circuits(set(STATE["preselect"]))
+        self.fill_edit_combo()
+        self.c["tabs"].SelectedIndex = STATE["tab"]
+        self.refresh_log()
 
     # ---------------------------------------------------------------- helpers
     @staticmethod
@@ -1473,11 +1606,6 @@ class CircuitManagerWindow(object):
         STATE["lc_panel"] = self.combo_tag(self.c["cmbLcPanel"])
         STATE["lc_down"] = bool(self.c["chkLcDown"].IsChecked)
         STATE["lc_deep"] = bool(self.c["chkLcDeep"].IsChecked)
-
-    def close_for(self, pending):
-        self.save_state()
-        STATE["pending"] = pending
-        self.win.Close()
 
     # ------------------------------------------------------------- fill lists
     def fill_panel_combos(self):
@@ -1591,7 +1719,7 @@ class CircuitManagerWindow(object):
 
     # ------------------------------------------------------------ TAB 1 events
     def on_pick_fixtures(self, s, e):
-        self.close_for("pick_fixtures")
+        self.run_pick(do_pick_fixtures)
 
     def on_remove_fix(self, s, e):
         rem = set(self.selected_tags(self.c["lstFixtures"]))
@@ -1668,7 +1796,7 @@ class CircuitManagerWindow(object):
         self.update_sel_count()
 
     def on_pick_circuits(self, s, e):
-        self.close_for("pick_circuits")
+        self.run_pick(do_pick_circuits)
 
     def on_refresh(self, s, e):
         self.fill_panel_combos()
@@ -1733,6 +1861,7 @@ class CircuitManagerWindow(object):
             return
         from System.Windows import MessageBox, MessageBoxButton, MessageBoxResult
         ans = MessageBox.Show(
+            self.win,
             u"Delete {0} circuit(s)?\n\nThe fixtures stay in the model, only the "
             u"circuits are removed. You can Undo this in Revit.".format(len(circuits)),
             u"Circuit Manager Pro", MessageBoxButton.YesNo)
@@ -1761,7 +1890,7 @@ class CircuitManagerWindow(object):
             log(u"Add: choose a circuit first.")
             self.refresh_log()
             return
-        self.close_for("add_elems")
+        self.run_pick(do_add_elems)
 
     def on_remove_elems(self, s, e):
         cid = self.combo_tag(self.c["cmbEditCircuit"])
@@ -1945,6 +2074,7 @@ class CircuitManagerWindow(object):
             return
         from System.Windows import MessageBox, MessageBoxButton, MessageBoxResult
         ans = MessageBox.Show(
+            self.win,
             u"Delete {0} load classification(s)?\n\n{1}\n\nNo element parameter uses them. A "
             u"family that has one fixed inside the family is not counted - run the check "
             u"afterwards. You can Undo this in Revit.".format(
@@ -1999,6 +2129,7 @@ class CircuitManagerWindow(object):
             return
         from System.Windows import MessageBox, MessageBoxButton, MessageBoxResult
         ans = MessageBox.Show(
+            self.win,
             u"Move every load, type and circuit that uses\n\n{0}\n\nto  {1}  and then delete "
             u"the classification(s) above?\n\nA family that has one fixed inside the family "
             u"cannot be changed from here - run the check afterwards. You can Undo this in "
@@ -2174,12 +2305,10 @@ class CircuitManagerWindow(object):
         self.refresh_log()
 
     def on_close(self, s, e):
-        self.save_state()
-        STATE["pending"] = None
         self.win.Close()
 
     def show(self):
-        self.win.ShowDialog()
+        self.win.Show()
 
 
 # =============================================================================
@@ -2244,30 +2373,20 @@ def main():
     if doc.IsFamilyDocument:
         print("Circuit Manager Pro works in a project, not in the Family Editor.")
         return
-    actions = {
-        "pick_fixtures": do_pick_fixtures,
-        "pick_circuits": do_pick_circuits,
-        "add_elems": do_add_elems,
-    }
-    while True:
-        STATE["pending"] = None
-        try:
-            CircuitManagerWindow().show()
-        except Exception as ex:
-            log(u"Dialog error: {0}".format(ex))
-            break
-        action = actions.get(STATE["pending"])
-        if action is None:
-            break
-        action()
-
-    if STATE["log"]:
-        print("Circuit Manager Pro - action log")
-        print("-" * 60)
-        for line in STATE["log"]:
-            print(line)
-    else:
-        print("Circuit Manager Pro - no changes made.")
+    # already open? bring it to the front instead of opening a second panel
+    try:
+        old = System.AppDomain.CurrentDomain.GetData(WINDOW_KEY)
+        if old is not None and old.IsVisible:
+            old.Activate()
+            return
+    except Exception:
+        pass
+    queue = ApiQueue()
+    queue.event = ExternalEvent.Create(queue)
+    panel = CircuitManagerWindow(queue)
+    System.AppDomain.CurrentDomain.SetData(WINDOW_KEY, panel.win)
+    panel.show()                  # modeless: the script ends, the panel stays
+    globals()["_PANEL"] = panel   # keep a reference while the panel is open
 
 
 main()
