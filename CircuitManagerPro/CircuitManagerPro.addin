@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RevitAddIns>
+  <AddIn Type="Application">
+    <Name>Circuit Manager Pro</Name>
+    <Assembly>CircuitManagerPro\CircuitManagerPro.dll</Assembly>
+    <FullClassName>CircuitManagerPro.App</FullClassName>
+    <ClientId>0e79b9de-743f-57b3-9114-7d0f871dd856</ClientId>
+    <VendorId>CMPR</VendorId>
+    <VendorDescription>Circuit Manager Pro</VendorDescription>
+  </AddIn>
+</RevitAddIns>
