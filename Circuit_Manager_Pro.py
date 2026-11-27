@@ -29,7 +29,9 @@ __doc__ = (
 #               they all look the same (duplicate names, parameter not linked
 #               to the connector, text parameter, several connectors,
 #               downstream panels, spares). Selected loads can be set to one
-#               classification in one click.
+#               classification in one click. The project's load
+#               classifications can be created, renamed (abbreviation, demand
+#               factor), cleaned of hidden spaces, deleted, or merged.
 #
 # Every action runs in its own Revit transaction, so each one can be undone
 # separately with Ctrl+Z after the dialog is closed.
@@ -694,6 +696,76 @@ def run_lc_check(panel, downstream, deep):
             "labels": dict((k, key_label(k)) for k in real), "usage": usage,
             "lcs": lcs, "dups": dups, "verdict": lines, "ok": ok, "deep": deep}
 
+# ---- editing the project's load classifications ------------------------------
+try:
+    from Autodesk.Revit.DB.Electrical import ElectricalDemandFactorDefinition
+except Exception:
+    ElectricalDemandFactorDefinition = None
+
+
+def clean_lc_name(name):
+    """Trim, collapse double spaces, replace non-breaking spaces."""
+    return u" ".join((name or u"").replace(u"\u00A0", u" ").split())
+
+
+def lc_name_conflict(name, lcs, exclude=None):
+    """Id of another classification whose name looks the same, else None."""
+    n = norm_name(name)
+    for v, lc in lcs.items():
+        if v != exclude and norm_name(lc.Name) == n:
+            return v
+    return None
+
+
+def demand_factors():
+    out = []
+    if ElectricalDemandFactorDefinition is None:
+        return out
+    for d in DB.FilteredElementCollector(doc).OfClass(ElectricalDemandFactorDefinition):
+        out.append((eid_val(d.Id), d.Name))
+    out.sort(key=lambda x: x[1].lower())
+    return out
+
+
+def project_lc_refs(lcs):
+    """{classification id: [(element or type, Parameter)]} for every load
+    classification parameter in the project: loads, their types, circuits."""
+    refs = {}
+
+    def add(owner, p):
+        refs.setdefault(eid_val(p.AsElementId()), []).append((owner, p))
+
+    cats = List[DB.BuiltInCategory]()
+    for b in CIRCUITABLE_BICS:
+        cats.Add(b)
+    col = (DB.FilteredElementCollector(doc)
+           .WherePasses(DB.ElementMulticategoryFilter(cats))
+           .WhereElementIsNotElementType())
+    names_by_type = {}
+    for el in col:
+        if not isinstance(el, DB.FamilyInstance):
+            continue
+        try:
+            sym = el.Symbol
+            sk = eid_val(sym.Id)
+        except Exception:
+            continue
+        if sk not in names_by_type:      # first instance of this type
+            names_by_type[sk] = [p.Definition.Name for p in el.Parameters if is_lc_param(p, lcs)]
+            for p in sym.Parameters:
+                if is_lc_param(p, lcs):
+                    add(sym, p)
+        for n in names_by_type[sk]:
+            p = el.LookupParameter(n)
+            if p is not None and p.StorageType == DB.StorageType.ElementId:
+                add(el, p)
+    for c in DB.FilteredElementCollector(doc).OfClass(ElectricalSystem):
+        for p in c.Parameters:
+            if is_lc_param(p, lcs):
+                add(c, p)
+    return refs
+
+
 BRUSH = BrushConverter()
 
 
@@ -703,7 +775,7 @@ BRUSH = BrushConverter()
 XAML = u"""
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Circuit Manager Pro" Width="1100" Height="780"
+        Title="Circuit Manager Pro" Width="1120" Height="830"
         MinWidth="860" MinHeight="600"
         WindowStartupLocation="CenterScreen" FontFamily="Segoe UI" FontSize="13"
         Background="#E9EEF5">
@@ -868,6 +940,24 @@ XAML = u"""
       </Setter>
     </Style>
 
+    <Style x:Key="SubTab" TargetType="TabItem">
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TabItem">
+            <Border x:Name="b" CornerRadius="7,7,0,0" Margin="1,0" Padding="9,5" Background="#DCE4F0">
+              <ContentPresenter x:Name="hdr" ContentSource="Header"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="b" Property="Background" Value="#2F6FE4"/>
+                <Setter TargetName="hdr" Property="TextElement.Foreground" Value="White"/>
+                <Setter TargetName="hdr" Property="TextElement.FontWeight" Value="SemiBold"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
     <Style x:Key="H2" TargetType="TextBlock">
       <Setter Property="FontSize" Value="15"/>
       <Setter Property="FontWeight" Value="Bold"/>
@@ -896,7 +986,7 @@ XAML = u"""
           <ControlTemplate TargetType="TabItem">
             <Border x:Name="b" CornerRadius="10,10,0,0" Margin="2,0"
                     Padding="18,8" Background="#C8D3E3">
-              <ContentPresenter ContentSource="Header"/>
+              <ContentPresenter x:Name="hdr" ContentSource="Header"/>
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsSelected" Value="True">
@@ -908,7 +998,7 @@ XAML = u"""
                     </LinearGradientBrush>
                   </Setter.Value>
                 </Setter>
-                <Setter Property="FontWeight" Value="Bold"/>
+                <Setter TargetName="hdr" Property="TextElement.FontWeight" Value="Bold"/>
               </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -1115,7 +1205,7 @@ XAML = u"""
         <Grid>
           <Grid.ColumnDefinitions>
             <ColumnDefinition Width="*"/>
-            <ColumnDefinition Width="340"/>
+            <ColumnDefinition Width="360"/>
           </Grid.ColumnDefinitions>
           <Border Style="{StaticResource Card}">
             <DockPanel>
@@ -1142,19 +1232,73 @@ XAML = u"""
           </Border>
           <Border Grid.Column="1" Style="{StaticResource Card}">
             <DockPanel>
-              <StackPanel DockPanel.Dock="Bottom">
-                <TextBlock Style="{StaticResource H2}" Margin="0,10,0,4" Text="Fix"/>
-                <TextBlock Style="{StaticResource Hint}"
-                           Text="Set the selected rows (a group header = all its rows) to:"/>
-                <ComboBox x:Name="cmbLcTarget" MinWidth="0"/>
-                <Button x:Name="btnLcFixSel" Style="{StaticResource BtnGreen}" Content="&#x2714; Apply to selected rows"/>
-                <Button x:Name="btnLcFixAll" Style="{StaticResource Btn3D}" Content="Apply to ALL loads on the panel"/>
-                <Button x:Name="btnLcSelect" Style="{StaticResource Btn3D}" Content="Select rows in Revit"/>
-              </StackPanel>
+              <TabControl DockPanel.Dock="Bottom" x:Name="tabsLc" Margin="0,8,0,0"
+                          Background="#F7F9FD" BorderBrush="#C9D4E3" Padding="8">
+                <TabItem Header="Fix loads" Style="{StaticResource SubTab}">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource Hint}"
+                               Text="Set the selected rows on the left (a group header = all its rows) to:"/>
+                    <ComboBox x:Name="cmbLcTarget" MinWidth="0"/>
+                    <Button x:Name="btnLcFixSel" Style="{StaticResource BtnGreen}" Content="&#x2714; Apply to selected rows"/>
+                    <Button x:Name="btnLcFixAll" Style="{StaticResource Btn3D}" Content="Apply to ALL loads on the panel"/>
+                    <Button x:Name="btnLcSelect" Style="{StaticResource Btn3D}" Content="Select rows in Revit"/>
+                  </StackPanel>
+                </TabItem>
+                <TabItem Header="Edit selected" Style="{StaticResource SubTab}">
+                  <StackPanel>
+                    <Grid>
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                      </Grid.ColumnDefinitions>
+                      <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                      </Grid.RowDefinitions>
+                      <TextBlock Text="Name" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                      <TextBox x:Name="txtLcName" Grid.Column="1" Padding="4" Margin="4"/>
+                      <TextBlock Grid.Row="1" Text="Abbreviation" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                      <TextBox x:Name="txtLcAbbr" Grid.Row="1" Grid.Column="1" Padding="4" Margin="4"/>
+                      <TextBlock Grid.Row="2" Text="Demand factor" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                      <ComboBox x:Name="cmbLcDemand" Grid.Row="2" Grid.Column="1" MinWidth="0"/>
+                    </Grid>
+                    <UniformGrid Columns="2">
+                      <Button x:Name="btnLcSave" Style="{StaticResource BtnGreen}" Content="&#x2714; Save"/>
+                      <Button x:Name="btnLcClean" Style="{StaticResource Btn3D}" Content="Clean name(s)"/>
+                    </UniformGrid>
+                    <Button x:Name="btnLcDelete" Style="{StaticResource BtnDanger}" Content="&#x2716; Delete selected (unused only)"/>
+                  </StackPanel>
+                </TabItem>
+                <TabItem Header="New / merge" Style="{StaticResource SubTab}">
+                  <StackPanel>
+                    <Grid>
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                      </Grid.ColumnDefinitions>
+                      <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                      </Grid.RowDefinitions>
+                      <TextBlock Text="New name" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                      <TextBox x:Name="txtLcNewName" Grid.Column="1" Padding="4" Margin="4"/>
+                      <TextBlock Grid.Row="1" Text="Abbreviation" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                      <TextBox x:Name="txtLcNewAbbr" Grid.Row="1" Grid.Column="1" Padding="4" Margin="4"/>
+                    </Grid>
+                    <Button x:Name="btnLcNew" Style="{StaticResource BtnGreen}" Content="&#x2795; Create load classification"/>
+                    <Separator Margin="0,8"/>
+                    <TextBlock Style="{StaticResource Hint}" Margin="0,0,0,2"
+                               Text="Merge the selected classification(s) into:"/>
+                    <ComboBox x:Name="cmbLcMerge" MinWidth="0"/>
+                    <Button x:Name="btnLcMerge" Style="{StaticResource Btn3D}" Content="&#x21C9; Merge, then delete selected"/>
+                  </StackPanel>
+                </TabItem>
+              </TabControl>
               <TextBlock DockPanel.Dock="Top" Style="{StaticResource H2}" Text="Load classifications in project"/>
               <TextBlock DockPanel.Dock="Top" Style="{StaticResource Hint}"
-                         Text="Red = another item has the same name (ignoring case and spaces). A dot marks a hidden space at the start or end of a name."/>
-              <ListBox x:Name="lstLcProject"/>
+                         Text="Click one to edit it (Ctrl/Shift for several). Red = another item has the same name. A dot marks a hidden space."/>
+              <ListBox x:Name="lstLcProject" SelectionMode="Extended"/>
             </DockPanel>
           </Border>
         </Grid>
@@ -1216,7 +1360,9 @@ class CircuitManagerWindow(object):
             "btnRemElems", "txtLog", "btnClose",
             "cmbLcPanel", "btnLcRun", "chkLcDown", "chkLcDeep", "bdLcVerdict",
             "txtLcVerdict", "lstLcRows", "cmbLcTarget", "btnLcFixSel", "btnLcFixAll",
-            "btnLcSelect", "lstLcProject"])
+            "btnLcSelect", "lstLcProject", "tabsLc", "txtLcName", "txtLcAbbr",
+            "cmbLcDemand", "btnLcSave", "btnLcClean", "btnLcDelete", "txtLcNewName",
+            "txtLcNewAbbr", "btnLcNew", "cmbLcMerge", "btnLcMerge"])
         self.lc = None
         self.lc_group_ids = {}
         self.busy = False
@@ -1230,6 +1376,7 @@ class CircuitManagerWindow(object):
         self.c["chkLcDown"].IsChecked = STATE["lc_down"]
         self.c["chkLcDeep"].IsChecked = STATE["lc_deep"]
         _lcs = all_load_classifications()
+        self.fill_lc_demand()
         self.fill_lc_project(_lcs)
         self.fill_lc_target(_lcs)
         self.refresh_log()
@@ -1246,6 +1393,9 @@ class CircuitManagerWindow(object):
             ("btnClose", self.on_close),
             ("btnLcRun", self.on_lc_run), ("btnLcFixSel", self.on_lc_fix_sel),
             ("btnLcFixAll", self.on_lc_fix_all), ("btnLcSelect", self.on_lc_select),
+            ("btnLcSave", self.on_lc_save), ("btnLcClean", self.on_lc_clean),
+            ("btnLcDelete", self.on_lc_delete), ("btnLcNew", self.on_lc_new),
+            ("btnLcMerge", self.on_lc_merge),
         ]
         for name, handler in ev:
             self.c[name].Click += self.safe(handler)
@@ -1253,6 +1403,7 @@ class CircuitManagerWindow(object):
         self.c["txtSearch"].TextChanged += self.safe(self.on_filter_changed)
         self.c["lstCircuits"].SelectionChanged += self.safe(self.on_circuit_sel_changed)
         self.c["cmbEditCircuit"].SelectionChanged += self.safe(self.on_edit_circuit_changed)
+        self.c["lstLcProject"].SelectionChanged += self.safe(self.on_lc_proj_sel)
 
     def safe(self, handler):
         """Never let an error escape a WPF event (it could crash Revit)."""
@@ -1632,12 +1783,15 @@ class CircuitManagerWindow(object):
     # ------------------------------------------------------- TAB 4 (load class)
     def fill_lc_project(self, lcs, usage=None):
         lst = self.c["lstLcProject"]
+        keep = set(self.selected_tags(lst))
         lst.Items.Clear()
         dups = duplicate_groups(lcs)
+        refs = project_lc_refs(lcs)
+        self.lc_use = dict((v, len(refs.get(v, []))) for v in lcs)
         for v, lc in sorted(lcs.items(), key=lambda kv: (norm_name(kv[1].Name), kv[0])):
-            txt = u"{0}   id {1}".format(lc_visible(lc.Name), v)
+            txt = u"{0}   id {1}   - used {2}x".format(lc_visible(lc.Name), v, self.lc_use[v])
             if usage is not None:
-                txt += u"   - {0} on panel".format(usage.get(v, 0))
+                txt += u", {0} on panel".format(usage.get(v, 0))
             if v in dups:
                 txt += u"\n      same name as id {0}".format(u", ".join(str(x) for x in dups[v]))
             it = self.list_item(txt, v)
@@ -1645,13 +1799,241 @@ class CircuitManagerWindow(object):
                 it.Foreground = Brushes.Firebrick
                 it.FontWeight = FontWeights.Bold
             lst.Items.Add(it)
+            if v in keep:
+                it.IsSelected = True
 
     def fill_lc_target(self, lcs, prefer=None):
-        cmb = self.c["cmbLcTarget"]
+        """Fills the Fix combo and the Merge combo."""
+        cmb, mrg = self.c["cmbLcTarget"], self.c["cmbLcMerge"]
+        keep_fix = self.combo_tag(cmb) if prefer is None else prefer
+        keep_mrg = self.combo_tag(mrg)
         cmb.Items.Clear()
+        mrg.Items.Clear()
         for v, lc in sorted(lcs.items(), key=lambda kv: (norm_name(kv[1].Name), kv[0])):
-            cmb.Items.Add(self.combo_item(u"{0}   (id {1})".format(lc_visible(lc.Name), v), v))
-        self.select_combo_tag(cmb, prefer)
+            label = u"{0}   (id {1})".format(lc_visible(lc.Name), v)
+            cmb.Items.Add(self.combo_item(label, v))
+            mrg.Items.Add(self.combo_item(label, v))
+        self.select_combo_tag(cmb, keep_fix)
+        self.select_combo_tag(mrg, keep_mrg)
+
+    def fill_lc_demand(self):
+        cmb = self.c["cmbLcDemand"]
+        cmb.Items.Clear()
+        cmb.Items.Add(self.combo_item(u"(none)", -1))
+        for v, name in demand_factors():
+            cmb.Items.Add(self.combo_item(name, v))
+
+    # ---- editing the classifications themselves
+    def lc_project_selection(self):
+        return [v for v in self.selected_tags(self.c["lstLcProject"]) if get_el(v) is not None]
+
+    def on_lc_proj_sel(self, s, e):
+        sel = self.lc_project_selection()
+        if not sel:
+            return
+        lc = get_el(sel[0])
+        self.c["txtLcName"].Text = lc.Name
+        try:
+            self.c["txtLcAbbr"].Text = lc.Abbreviation or u""
+        except Exception:
+            self.c["txtLcAbbr"].Text = u""
+        try:
+            self.select_combo_tag(self.c["cmbLcDemand"], eid_val(lc.DemandFactorId))
+        except Exception:
+            pass
+
+    def after_lc_edit(self, select_id=None):
+        lcs = all_load_classifications()
+        if select_id is not None:
+            lst = self.c["lstLcProject"]
+            lst.UnselectAll()
+        if getattr(self, "lc", None):
+            self.lc_run(False)              # refresh the check with the new names
+        else:
+            self.fill_lc_project(lcs)
+            self.fill_lc_target(lcs)
+        if select_id is not None:
+            for it in self.c["lstLcProject"].Items:
+                if it.Tag == select_id:
+                    it.IsSelected = True
+                    self.c["lstLcProject"].ScrollIntoView(it)
+            self.on_lc_proj_sel(None, None)
+        self.refresh_log()
+
+    def on_lc_save(self, s, e):
+        sel = self.lc_project_selection()
+        if not sel:
+            log(u"Edit: click a load classification in the list first.")
+            self.refresh_log()
+            return
+        v = sel[0]
+        lc = get_el(v)
+        name = self.c["txtLcName"].Text or u""
+        if not name.strip():
+            log(u"Edit: the name cannot be empty.")
+            self.refresh_log()
+            return
+        lcs = all_load_classifications()
+        clash = lc_name_conflict(name, lcs, exclude=v)
+        if clash is not None:
+            log(u"Edit: {0} would look the same as id {1} {2} - use New / merge > Merge "
+                u"instead.".format(lc_visible(name), clash, lc_visible(lcs[clash].Name)))
+            self.refresh_log()
+            return
+        old = lc.Name
+        with Tx("Edit load classification"):
+            if lc.Name != name:
+                lc.Name = name
+            abbr = self.c["txtLcAbbr"].Text or u""
+            try:
+                if (lc.Abbreviation or u"") != abbr:
+                    lc.Abbreviation = abbr
+            except Exception as ex:
+                log(u"  ! abbreviation not changed: {0}".format(ex))
+            dv = self.combo_tag(self.c["cmbLcDemand"])
+            try:
+                if dv is not None and eid_val(lc.DemandFactorId) != dv:
+                    lc.DemandFactorId = to_eid(dv)
+            except Exception as ex:
+                log(u"  ! demand factor not changed: {0}".format(ex))
+        log(u"Edit: load classification {0} (id {1}) saved as {2}.".format(
+            lc_visible(old), v, lc_visible(name)))
+        self.after_lc_edit(v)
+
+    def on_lc_clean(self, s, e):
+        sel = self.lc_project_selection()
+        if not sel:
+            sel = list(all_load_classifications().keys())     # nothing selected = all
+        lcs = all_load_classifications()
+        done, clashes = 0, []
+        with Tx("Clean load classification names"):
+            for v in sel:
+                lc = lcs[v]
+                new = clean_lc_name(lc.Name)
+                if not new or new == lc.Name:
+                    continue
+                other = [x for x, o in lcs.items() if x != v and o.Name == new]
+                if other:
+                    clashes.append(u"{0} (id {1}) -> {2} already exists as id {3}".format(
+                        lc_visible(lc.Name), v, lc_visible(new), other[0]))
+                    continue
+                old = lc.Name
+                lc.Name = new
+                done += 1
+                log(u"  renamed {0} -> {1} (id {2})".format(lc_visible(old), lc_visible(new), v))
+        log(u"Clean names: {0} renamed{1}.".format(
+            done, u", {0} could not be renamed because the clean name already exists - "
+                  u"merge them instead".format(len(clashes)) if clashes else u""))
+        for c in clashes:
+            log(u"  ! " + c)
+        self.after_lc_edit()
+
+    def on_lc_delete(self, s, e):
+        sel = self.lc_project_selection()
+        if not sel:
+            log(u"Delete: select load classification(s) in the list first.")
+            self.refresh_log()
+            return
+        lcs = all_load_classifications()
+        used = [v for v in sel if getattr(self, "lc_use", {}).get(v, 0) > 0]
+        free = [v for v in sel if v not in used]
+        for v in used:
+            log(u"  ! {0} (id {1}) is used by {2} parameter(s) - use New / merge > Merge to move "
+                u"them first.".format(lc_visible(lcs[v].Name), v, self.lc_use[v]))
+        if not free:
+            self.refresh_log()
+            return
+        from System.Windows import MessageBox, MessageBoxButton, MessageBoxResult
+        ans = MessageBox.Show(
+            u"Delete {0} load classification(s)?\n\n{1}\n\nNo element parameter uses them. A "
+            u"family that has one fixed inside the family is not counted - run the check "
+            u"afterwards. You can Undo this in Revit.".format(
+                len(free), u"\n".join(lcs[v].Name for v in free)),
+            u"Circuit Manager Pro", MessageBoxButton.YesNo)
+        if ans != MessageBoxResult.Yes:
+            return
+        ok = 0
+        with Tx("Delete load classifications"):
+            for v in free:
+                try:
+                    doc.Delete(to_eid(v))
+                    ok += 1
+                except Exception as ex:
+                    log(u"  x {0} (id {1}): {2}".format(lc_visible(lcs[v].Name), v, ex))
+        log(u"Delete: {0} load classification(s) deleted.".format(ok))
+        self.after_lc_edit()
+
+    def on_lc_new(self, s, e):
+        name = self.c["txtLcNewName"].Text or u""
+        if not name.strip():
+            log(u"New: type a name first.")
+            self.refresh_log()
+            return
+        lcs = all_load_classifications()
+        clash = lc_name_conflict(name, lcs)
+        if clash is not None:
+            log(u"New: {0} already exists (id {1}).".format(lc_visible(lcs[clash].Name), clash))
+            self.refresh_log()
+            return
+        with Tx("New load classification"):
+            lc = ElectricalLoadClassification.Create(doc, name)
+            abbr = self.c["txtLcNewAbbr"].Text or u""
+            if abbr:
+                try:
+                    lc.Abbreviation = abbr
+                except Exception as ex:
+                    log(u"  ! abbreviation not set: {0}".format(ex))
+        log(u"New: load classification {0} created (id {1}).".format(lc_visible(name), eid_val(lc.Id)))
+        self.c["txtLcNewName"].Text = u""
+        self.c["txtLcNewAbbr"].Text = u""
+        self.after_lc_edit(eid_val(lc.Id))
+
+    def on_lc_merge(self, s, e):
+        tgt = self.combo_tag(self.c["cmbLcMerge"])
+        srcs = [v for v in self.lc_project_selection() if v != tgt]
+        lcs = all_load_classifications()
+        if tgt not in lcs or not srcs:
+            log(u"Merge: select the classification(s) to remove in the list and the one to "
+                u"keep in the Merge combo.")
+            self.refresh_log()
+            return
+        from System.Windows import MessageBox, MessageBoxButton, MessageBoxResult
+        ans = MessageBox.Show(
+            u"Move every load, type and circuit that uses\n\n{0}\n\nto  {1}  and then delete "
+            u"the classification(s) above?\n\nA family that has one fixed inside the family "
+            u"cannot be changed from here - run the check afterwards. You can Undo this in "
+            u"Revit.".format(u"\n".join(u"{0}  (id {1})".format(lc_visible(lcs[v].Name), v) for v in srcs),
+                             lc_visible(lcs[tgt].Name)),
+            u"Circuit Manager Pro", MessageBoxButton.YesNo)
+        if ans != MessageBoxResult.Yes:
+            return
+        refs = project_lc_refs(lcs)
+        tgt_id = to_eid(tgt)
+        moved, readonly, deleted = 0, 0, 0
+        with Tx("Merge load classifications"):
+            for v in srcs:
+                for owner, p in refs.get(v, []):
+                    if p.IsReadOnly:
+                        readonly += 1
+                        continue
+                    try:
+                        p.Set(tgt_id)
+                        moved += 1
+                    except Exception as ex:
+                        readonly += 1
+                        log(u"  x id {0} '{1}': {2}".format(eid_val(owner.Id), p.Definition.Name, ex))
+            for v in srcs:
+                try:
+                    doc.Delete(to_eid(v))
+                    deleted += 1
+                except Exception as ex:
+                    log(u"  ! could not delete {0} (id {1}): {2}".format(lc_visible(lcs[v].Name), v, ex))
+        msg = u"Merge: {0} parameter(s) moved to {1}, {2} classification(s) deleted".format(
+            moved, lc_visible(lcs[tgt].Name), deleted)
+        if readonly:
+            msg += u", {0} read-only parameter(s) not changed".format(readonly)
+        log(msg + u".")
+        self.after_lc_edit(tgt)
 
     def show_lc(self, res):
         self.lc = res
@@ -1687,6 +2069,9 @@ class CircuitManagerWindow(object):
         self.fill_lc_target(res["lcs"], prefer)
 
     def on_lc_run(self, s, e):
+        self.lc_run(True)
+
+    def lc_run(self, write_log):
         pid = self.combo_tag(self.c["cmbLcPanel"])
         panel = get_el(pid) if pid is not None else None
         if panel is None:
@@ -1695,9 +2080,10 @@ class CircuitManagerWindow(object):
         res = run_lc_check(panel, bool(self.c["chkLcDown"].IsChecked),
                            bool(self.c["chkLcDeep"].IsChecked))
         self.show_lc(res)
-        log(u"Load classification check of '{0}':".format(res["panel"]))
-        for line in res["verdict"]:
-            log(u"   " + line)
+        if write_log:
+            log(u"Load classification check of '{0}':".format(res["panel"]))
+            for line in res["verdict"]:
+                log(u"   " + line)
         self.refresh_log()
 
     def lc_selected_ids(self):
@@ -1769,7 +2155,7 @@ class CircuitManagerWindow(object):
         if failed:
             msg += u", {0} failed".format(failed)
         log(msg + u".")
-        self.on_lc_run(None, None)
+        self.lc_run(False)
         self.refresh_all()
 
     def on_lc_fix_sel(self, s, e):
